@@ -170,6 +170,18 @@ def stationarity(lab, start=IS_START, end=IS_END):
     return dict(adj=adj, adj_stat=stat, adj_p=p, adj_lags=lags, adj_n=nobs, adj_hl=half_life(adj), per=per)
 
 
+def window_from_half_life(hl):
+    """③ 的窗口：不超过半衰期的最大网格窗口。预定规则是半衰期取整，但样本内半衰期约 290 天，
+    每组合约在持时自己的历史只有一百多天，290 天窗口下 z 一天也算不出，所以以网格最大可行窗口为上限。"""
+    return max(w for w in WINDOWS if w <= hl)
+
+
+def z_coverage(lab, w, start=IS_START, end=IS_END):
+    """换月日历下样本内 z 能算出的天数 / 总天数。"""
+    za = pick(lab.z(w), lab.cal['roll']).loc[start:end]
+    return int(za.notna().sum()), len(za)
+
+
 def costs(lab, params, start, end):
     rule = rule_of(params['entry'], params['exit'], params['stop_mult'])
     rows, runs = [], {}
