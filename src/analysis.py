@@ -206,6 +206,15 @@ def roll_stats(lab):
     return dict(n_is=int(ins.sum()), lead_med=float(np.median(lead[ins])), table=tab)
 
 
+def early_liquidity(lab, start='20141201', end=IS_START):
+    """样本内起点之前在持组各腿日成交量中位数与某腿无成交的天数（说明起点为何放在 2015-05）。"""
+    mkt, cal = lab.mkt, lab.cal['roll']
+    days = cal.loc[start:end].index[:-1]
+    v = {l: pick(mkt.vol[l], cal).loc[days] for l in LEGS}
+    return dict(months=sorted(set(cal.loc[days])), vol={l: s.median() for l, s in v.items()},
+                zero_days=int((sum(s == 0 for s in v.values()) > 0).sum()), n=len(days))
+
+
 def live(lab, runs, start=IS_START, end=IS_END):
     """隔夜跳空、名义额与保证金、单边成本、持仓期最大浮亏、在持合约成交量。"""
     mkt, cal = lab.mkt, lab.cal['roll']

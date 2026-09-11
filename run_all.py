@@ -41,6 +41,7 @@ def main():
     R['oos_years'] = len(R['oos'][1]['open', 1][0]) / 252
     R['live'] = A.live(lab, R['cost_is'][1])
     R['rolls'] = A.roll_stats(lab)
+    R['early'] = A.early_liquidity(lab)
 
     out = A.REPORT
     R['orig'][1].to_csv(out / 'trades_original.csv', index=False)
