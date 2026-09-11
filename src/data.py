@@ -102,16 +102,19 @@ def prev_month_start(month):
     return (pd.Timestamp(month + '01') - pd.DateOffset(months=1)).strftime('%Y%m%d')
 
 
-def roll_calendar(mkt, buffer=3):
+def roll_calendar(mkt, buffer=3, months=None):
     """修正版换月日历：每天在持哪一组合约（交割月）。
 
-    - 候选：前一交易日三腿都有收盘价、且今天不晚于「交割月前一个月首个交易日」前 buffer 个交易日的组
+    - 候选：前一交易日三腿都有收盘价、且今天不晚于「交割月前一个月首个交易日」前 buffer 个交易日的组；
+      months 给定时（如 ('01', '05', '09')）只在这些月份里选
     - 选前一交易日 MA 持仓量最大的组（MA 主力），只向后换不回头
     - buffer=3 保证收盘成交与次日开盘成交两种口径都在交割月前一个月之前换完
     """
     dates = mkt.dates
     oi = mkt.oi['MA'].to_numpy()
     ok = np.logical_and.reduce([mkt.close[l].notna().to_numpy() for l in LEGS]) & ~np.isnan(oi)
+    if months is not None:
+        ok &= np.array([m[4:] in months for m in mkt.months])
     ftd_idx = np.array([np.searchsorted(dates, prev_month_start(m)) for m in mkt.months])
     last_ok = np.where(ftd_idx < len(dates), ftd_idx - buffer, len(dates))  # 截止日在数据之后的组到末尾都可选
     out = [None] * len(dates)

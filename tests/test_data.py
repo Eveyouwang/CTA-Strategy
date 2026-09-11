@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.analysis import MAIN_MONTHS
 from src.check_data import tick_evidence
 from src.data import (L_TICK5_BEFORE, holdings, load_market, pick, prev_month_start, roll_calendar,
                       rolling_stats, zscore)
@@ -27,6 +28,22 @@ def test_never_hold_delivery_month(cal):
     for c in h.columns:
         assert (day_month != h[c]).all()
         assert (h.index < h[c].map(prev_month_start)).all()
+
+
+@pytest.fixture(scope='module')
+def cal2(mkt):
+    return roll_calendar(mkt, months=MAIN_MONTHS)
+
+
+def test_round2_calendar_main_months_only(cal2):
+    """第二轮换月：只持 01/05/09 月份、只向后换、首个有效日之后每天都有在持组；同样不进交割月及其前一个月。"""
+    held = cal2.dropna()
+    assert held.str[4:].isin(MAIN_MONTHS).all()
+    assert held.is_monotonic_increasing and cal2.loc[held.index[0]:].notna().all()
+    h = holdings(cal2).dropna()
+    for c in h.columns:
+        assert (h.index.str[:6] != h[c]).all()
+        assert (h.index.to_numpy() < h[c].map(prev_month_start).to_numpy()).all()
 
 
 def test_window_excludes_today(mkt):
