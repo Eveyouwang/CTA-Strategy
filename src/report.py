@@ -81,7 +81,7 @@ def fig_lines(panels, path, height=3.2):
 
 def fig_heatmap(g, sel, path):
     vmax = np.nanmax(np.abs(g['sharpe']))
-    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8), constrained_layout=True)
     for r, fill in enumerate(FILLS):
         for c, x in enumerate(EXITS):
             ax = axes[r, c]
@@ -95,8 +95,10 @@ def fig_heatmap(g, sel, path):
                 ax.add_patch(plt.Rectangle((j - .5, i - .5), 1, 1, fill=False, ec='black', lw=2.5))
             ax.set_xticks(range(len(ENTRIES)), [f'{e:g}' for e in ENTRIES])
             ax.set_yticks(range(len(WINDOWS)), [str(w) for w in WINDOWS])
-            ax.set_xlabel('entry |z|')
-            ax.set_ylabel('window (days)')
+            if r == 1:
+                ax.set_xlabel('entry |z|')
+            if c == 0:
+                ax.set_ylabel('window (days)')
             ax.set_title(f'{FILL_EN[fill]}, exit={x:g}', fontsize=10)
     fig.colorbar(im, ax=axes, shrink=0.6, label='Sharpe (in-sample, 1 tick)')
     fig.savefig(path, dpi=120)
@@ -152,7 +154,24 @@ def write(R):
     yr = R['yearly']
     d_c, d_o = df['open'], df['close']
     oos_t = R['oos'][1]['open', 1][1]
-    rolls = R['rolls']
+    rolls, ts, er = R['rolls'], R['ts'], R['early']
+    fmdd = [row(fx_tab, version=n, fill='open')['mdd'] for n in names]
+    fn = [int(row(fx_tab, version=n, fill='open')['n']) for n in names]
+    steps = [f'{names[k]}：夏普 {num(fsh[k - 1])}→{num(fsh[k])}，最大回撤 {pct(fmdd[k - 1])}→{pct(fmdd[k])}，交易 {fn[k - 1]}→{fn[k]} 笔'
+             for k in range(1, len(names))]
+    edge = [t for t, ok in (('窗口取最大值', P['window'] == max(WINDOWS)), ('窗口取最小值', P['window'] == min(WINDOWS)),
+                            ('开仓取最大值', P['entry'] == max(ENTRIES)), ('开仓取最小值', P['entry'] == min(ENTRIES)),
+                            ('平仓取最大值', P['exit'] == max(EXITS)), ('平仓取最小值', P['exit'] == min(EXITS))) if ok]
+    ti = R['cost_is'][1]['open', 1][1]
+    side = ti.groupby('side')['net'].agg(['size', 'sum'])
+    tc, to_ = R['oos'][1]['close', 1][1], R['oos'][1]['open', 1][1]
+    mg = tc.merge(to_, on='open_signal', suffixes=('_c', '_o'))
+    gd = mg['pnl_c'] - mg['pnl_o']
+    k = gd.idxmax()
+    kd = mg.at[k, 'open_signal']
+    i_k = mkt.dates.searchsorted(kd)
+    s_jump = (mkt.S_close.at[kd, mg.at[k, 'month_c']], mkt.S_open.iat[i_k + 1, mkt.months.index(mg.at[k, 'month_c'])])
+    yn = R['yearly']['n']
 
     s = []
     s.append(f"""# MTO 价差策略复盘：复现、缺陷与修正
@@ -184,13 +203,13 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 **无成交日**：日线中收盘价缺失 {R['fills']['收盘用结算价补']:,} 行，用当日结算价补；开盘价缺失 {R['fills']['开盘用收盘价补']:,} 行，用补后的收盘价补（共 {R['fills']['总行数']:,} 行）。期货按结算价盯市，这条规则主要影响原版持有到期那几天。
 
-**样本内起点**：10 吨/手的 MA 合约 2014 年 6 月才上市。2014-12-01 至 {day(IS_START)} 之前换月日历在持的组为 {'、'.join(R['early']['months'])}，其 L、PP 腿日成交量中位数只有 {R['early']['vol']['L']:,.0f} 手、{R['early']['vol']['PP']:,.0f} 手，{R['early']['n']} 个交易日中有 {R['early']['zero_days']} 天某条腿没有成交。样本内从 {day(IS_START)} 开始（此时已换到三腿都活跃的组），这个起点在跑任何回测之前按流动性定下。
+**样本内起点**：10 吨/手的 MA 合约 2014 年 6 月才上市。2014-12-01 至 {day(er['last'])} 换月日历在持的组为 {'、'.join(R['early']['months'])}，其 L、PP 腿日成交量中位数只有 {R['early']['vol']['L']:,.0f} 手、{R['early']['vol']['PP']:,.0f} 手，{R['early']['n']} 个交易日中有 {R['early']['zero_days']} 天某条腿没有成交。样本内从 {day(IS_START)} 开始（此时已换到三腿都活跃的组），这个起点在跑任何回测之前按流动性定下。
 
-**换月**：三腿用同一交割月。每天在候选组里选前一交易日 MA 持仓量最大的那组（MA 主力），只向后换；某组合约在「交割月前一个月的首个交易日」之前 3 个交易日起不再选用，这样收盘成交和次日开盘成交两种口径都能在交割月前一个月之前换完。换月当天平旧开新，两边都计成本。样本内共换月 {rolls['n_is']} 次，换月日距交割月前一个月首日的交易日数中位数为 {rolls['lead_med']:.0f} 天。
+**换月**：三腿用同一交割月。每天在候选组里选前一交易日 MA 持仓量最大的那组（MA 主力），只向后换；某组合约在「交割月前一个月的首个交易日」之前 3 个交易日起不再选用，这样收盘成交和次日开盘成交两种口径都能在交割月前一个月之前换完。换月当天平旧开新，两边都计成本。样本内共换月 {rolls['n_is']} 次，换月日距交割月前一个月首日的交易日数中位数为 {rolls['lead_med']:.0f} 天，多数换月由截止日触发，此时 MA 持仓量还没有转到下一个主力合约。样本内有 {rolls['n_odd']} 次在截止日换到了非 01/05/09 月份（2022 年起郑商所甲醇这些月份的持仓量一度超过下一个 01/05/09 合约，规则选中了当时持仓量最大的可选组），随后 {rolls['lag_min']}–{rolls['lag_max']} 个交易日内又换到 01/05/09 月份，有持仓时多付一次换月成本。这是换月规则的缺陷，在样本外运行之后才发现，没有改（见 BLOCKED.md）。
 
 **μ、σ 的算法**：每组合约只用它自己过去 w 天的 S。例如换月当天，z 用新组合约过去 w 天的 S 算，不用「旧组历史接新组当日」的拼接序列，避免换月跳空伪造信号。`tests/test_data.py` 对此有专门测试。
 
-**成交与成本**：信号每天收盘算一次。乐观口径按信号日收盘价成交，保守口径按次日开盘价成交（三个品种有夜盘的时期，次日开盘即当晚夜盘开盘）。每腿每边手续费 = 名义额 × {FEE:.4f}，另加滑点 1 跳（另测 0 跳、2 跳）。1 单位 = 1 手 L + 1 手 PP + 3 手 MA，按样本内在持合约的收盘价，1 单位单边成本中位数约 {lv['cost_side_med']:.0f} 元，其中滑点 {lv['slip_side']:.0f} 元。
+**成交与成本**：信号每天收盘算一次。乐观口径按信号日收盘价成交，保守口径按次日开盘价成交（三个品种有夜盘的时期，次日开盘即当晚夜盘开盘）。每腿每边手续费 = 名义额 × {FEE:.4f}，另加滑点 1 跳（另测 0 跳、2 跳）。1 单位 = 1 手 L + 1 手 PP + 3 手 MA，按样本内在持合约的收盘价，1 单位单边成本中位数约 {lv['cost_side_med']:.0f} 元；其中 1 跳滑点在 {day(L_TICK5_BEFORE)} 前为 {lv['slip_before']:.0f} 元、之后为 {lv['slip_after']:.0f} 元。
 
 **收益口径**：日收益率 = 当日净盈亏 / ({MARGIN:.0%} × 前一交易日在持合约 1 单位名义总额)。1 单位名义总额中位数约 {lv['notional_med']/1e4:.1f} 万元，对应保证金约 {lv['margin_med']/1e4:.2f} 万元。净值按日收益简单累加（仓位固定 1 单位，不复利）；年化收益 = 日均收益 × 252；夏普 = 年化收益 / 年化波动（无风险利率取 0，空仓日收益记 0）；最大回撤按累加净值相对前高计算。
 
@@ -207,7 +226,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 （fill：close 为乐观口径，open 为保守口径。）交易明细见 `report/trades_original.csv`。
 
 - 原版在样本内保守口径、1 跳成本下年化收益 {pct(v0c.ann_ret)}，夏普 {num(v0c.sharpe)}，最大回撤 {pct(v0c.mdd)}，共 {int(v0c.n)} 笔交易，胜率 {pct(v0c.win)}。乐观口径夏普 {num(v0o.sharpe)}；零成本保守口径夏普 {num(v0z.sharpe)}。{'最大回撤超过 100%，按 12% 保证金持 1 单位，回撤期间亏掉的钱超过全部保证金，实盘会被强平。' if v0c.mdd > 1 else ''}
-- 在原脚本自己的 2409 合约与区间上（保守口径、1 跳），共 {int(dm.n)} 笔交易，年化收益 {pct(dm.ann_ret)}，夏普 {num(dm.sharpe)}。区间只有半年，交易笔数少，这组数只用来核对复现本身。
+- 在原脚本自己的 2409 合约与区间上（保守口径、1 跳），共 {int(dm.n)} 笔交易，年化收益 {pct(dm.ann_ret)}，夏普 {num(dm.sharpe)}。区间只有半年、{int(dm.n)} 笔交易；同一逻辑放到整个样本内夏普为 {num(v0c.sharpe)}，{'原脚本自带的回测区间恰好是这个策略表现好的一段。' if dm.sharpe > v0c.sharpe + 0.5 else '两者差别不大。'}
 
 ![原版净值](fig/equity_original.png)
 
@@ -215,12 +234,12 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 以下定量都取原版样本内结果（1 跳成本），括号前为保守口径，括号内为乐观口径。
 
-1. **止损后没有冷静期**。止损把 `in_position` 置为 False 后，下一次判断时 z 往往仍在 ±2 以外，会按原方向立刻重开。样本内止损 {d_c['n_stop']} 次（{d_o['n_stop']} 次），其中止损次日同方向重开 {d_c['n_reentry']} 次（{d_o['n_reentry']} 次），这些重开交易净盈亏合计 {d_c['reentry_net']:,.0f} 元/单位（{d_o['reentry_net']:,.0f}）。原脚本在盘中每个 tick 都判断，重开可能发生在止损后的下一个 tick，日线回测看不到这一层。
-2. **不换月**。合约写死，到期前一个多月流动性已转到下一个合约，交割月前一个月交易所上调保证金、自然人不能进入交割月。样本内有仓位的 {d_c['held_days']} 天中，有 {d_c['late_days']} 天落在交割月前一个月或交割月（其中交割月 {d_c['deliv_days']} 天），这些天的净盈亏合计 {d_c['late_net']:,.0f} 元/单位；这些天在持 MA 合约日成交量中位数 {d_c['vol_late']:,.0f} 手，其余持仓日为 {d_c['vol_normal']:,.0f} 手。到期强平 {d_c['n_expiry']} 次。
+1. **止损后没有冷静期**。止损把 `in_position` 置为 False 后，下一次判断时 z 往往仍在 ±2 以外，会按原方向立刻重开。样本内止损 {d_c['n_stop']} 次（{d_o['n_stop']} 次），其中止损次日同方向重开 {d_c['n_reentry']} 次（{d_o['n_reentry']} 次），这些重开交易净盈亏合计 {d_c['reentry_net']:,.0f} 元/单位（{d_o['reentry_net']:,.0f}），胜率 {pct(d_c['reentry_win'])}（{pct(d_o['reentry_win'])}）。原脚本在盘中每个 tick 都判断，重开可能发生在止损后的下一个 tick，日线回测看不到这一层。
+2. **不换月**。合约写死，到期前一个多月流动性已转到下一个合约，临近交割月交易所分段提高保证金，个人客户的持仓不能进入交割月。样本内有仓位的 {d_c['held_days']} 天中，有 {d_c['late_days']} 天落在交割月前一个月或交割月（其中交割月 {d_c['deliv_days']} 天），这些天的净盈亏合计 {d_c['late_net']:,.0f} 元/单位（{d_o['late_net']:,.0f}），全部持仓日合计 {d_c['total_net']:,.0f}（{d_o['total_net']:,.0f}）；这些天在持 MA 合约日成交量中位数 {d_c['vol_late']:,.0f} 手，其余持仓日为 {d_c['vol_normal']:,.0f} 手。到期强平 {d_c['n_expiry']} 次。
 3. **平仓条件不分方向**。平仓要求 |z| < 0.5。如果做空后 z 一天内从 2 以上跌到 −0.5 以下，价差已越过均值，脚本仍持仓，要等 z 回到 ±0.5 以内才平，而持空的止损只看 z > 3。样本内有 {d_c['n_overshoot']} 笔交易（{d_o['n_overshoot']} 笔）在持仓期间出现过 z 越过均值到另一侧 0.5 以外仍未平仓。另外平仓阈值取 0 时 |z| < 0 永远不成立，网格里测平仓阈值 0 需要改成方向性判断。
-4. **窗口 {W0} 天与价差回归速度对不上**。样本内去掉换月跳空后的连续价差，AR(1) 半衰期为 {st['adj_hl']:.1f} 个交易日，ADF 检验 p 值 {st['adj_p']:.2f}；每组合约在持期内单独估计，半衰期中位数 {st['per']['hl'].median():.1f} 天，但 {len(st['per'])} 组里只有 {int((st['per']['p'] < 0.05).sum())} 组 ADF 在 5% 水平拒绝单位根。两种估计相差一个数量级，日频上价差均值回归的证据弱。
+4. **窗口 {W0} 天与价差回归速度对不上**。样本内去掉换月跳空后的连续价差，AR(1) 半衰期为 {st['adj_hl']:.1f} 个交易日，ADF 检验 p 值 {st['adj_p']:.2f}；每组合约在持期内单独估计，半衰期中位数 {st['per']['hl'].median():.1f} 天，但 {len(st['per'])} 组里只有 {int((st['per']['p'] < 0.05).sum())} 组 ADF 在 5% 水平拒绝单位根。两种估计相差约 {st['adj_hl'] / st['per']['hl'].median():.0f} 倍，日频上价差均值回归的证据弱。
 5. **`position_time` 记录了没用**，没有持仓时间上限。
-6. 其他（日线回测无法定量，只列出）：三腿 K 线按序号对齐而非按日期，某腿缺一根 K 线时三腿会错位；`current_l_pos` 取的是成交回报后的实际持仓，委托未成交时止损判断会失效；回测未计手续费和滑点；100 手 L、300 手 MA 的下单量未考虑盘口深度。
+6. 其他（日线回测无法定量，只列出）：三腿 K 线按序号对齐而非按日期，某腿缺一根 K 线时三腿会错位；`current_l_pos` 取的是成交回报后的实际持仓，委托未成交时止损判断会失效；100 手 L、300 手 MA 的下单量未考虑盘口深度。
 
 ## 5 修正版（样本内，1 跳成本）
 
@@ -233,7 +252,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 {mtable(fx_tab, ['version', 'fill'], '版本 / 成交')}
 
-保守口径下各步夏普：""" + '；'.join(f'{n} {num(v)}' for n, v in zip(names, fsh)) + f"""。年化收益：""" + '；'.join(f'{n} {pct(v)}' for n, v in zip(names, far)) + f"""。
+保守口径逐步变化：""" + '；'.join(steps) + f"""。
 
 ![各版本净值](fig/equity_versions.png)
 
@@ -243,7 +262,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 ![夏普热力图](fig/heatmap_sharpe.png)
 
-保守口径 36 格中夏普为正的有 {int((gi['sharpe'] > 0).sum())} 格，中位数 {num(gi['sharpe'].median())}，最高 {num(gi['sharpe'].max())}，最低 {num(gi['sharpe'].min())}。
+保守口径 36 格中夏普为正的有 {int((gi['sharpe'] > 0).sum())} 格，中位数 {num(gi['sharpe'].median())}，最高 {num(gi['sharpe'].max())}，最低 {num(gi['sharpe'].min())}。{('选中格处在网格边上（' + '、'.join(edge) + '），邻域比内部格少，网格以外的参数没有测。') if edge else ''}
 
 **选参规则**：每格与它在窗口、开仓、平仓三个方向上的相邻格（含对角，边界截断）取保守口径夏普的平均，选平均最高的格，不看单点最高。选出窗口 {P['window']}、开仓 {P['entry']:g}、平仓 {P['exit']:g}：本格夏普 {num(P['sharpe'])}，邻域平均 {num(P['neighborhood_sharpe'])}。单点最高的格是窗口 {P['best_single']['window']}、开仓 {P['best_single']['entry']:g}、平仓 {P['best_single']['exit']:g}，夏普 {num(P['best_single']['sharpe'])}，其邻域平均 {num(P['best_single']['neighborhood_sharpe'])}。参数已写入 `report/params.json` 并单独提交，之后才运行样本外。本次运行按同一规则重算的选择与冻结参数{'一致' if same else '不一致（样本外仍用冻结参数）'}。
 
@@ -251,7 +270,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 {table(yr.rename(columns={'ret': '年度收益', 'sharpe': '夏普', 'mdd': '年内最大回撤', 'n': '开仓次数'}).rename_axis('年份'), {'年度收益': pct, '年内最大回撤': pct, '开仓次数': lambda v: f'{int(v)}'})}
 
-样本内 {len(yr)} 个年度中收益为正的有 {int((yr['ret'] > 0).sum())} 个。
+样本内 {len(yr)} 个年度中收益为正的有 {int((yr['ret'] > 0).sum())} 个；冻结参数样本内共 {int(pc.n)} 笔交易，每年 {yn.min()}–{yn.max()} 笔，年度收益在 {pct(yr['ret'].min())} 到 {pct(yr['ret'].max())} 之间。
 
 **成本敏感性**（冻结参数，样本内）：
 
@@ -265,6 +284,8 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 每组合约在持期内单独检验（在持不少于 40 天的 {len(st['per'])} 组）：ADF p < 0.05 的有 {int((st['per']['p'] < 0.05).sum())} 组，p 值中位数 {st['per']['p'].median():.3f}；半衰期中位数 {st['per']['hl'].median():.1f} 天。
 
+**价差的期限结构**：样本内 {ts['n']} 次换月中，新组合约的 S 低于旧组同日收盘的占 {pct(ts['gap_neg'])}，平均差 {ts['gap_mean']:,.0f} 元/单位。在持组逐日变化累加为 {st['adj'].iloc[-1]:+,.0f} 元，而在持组原始 S 从 {ts['raw0']:,.0f} 元变为 {ts['raw1']:,.0f} 元：远月组的利润价差系统性低于近月组，每组在持期间 S 平均向上走（见第 2 节图中第二幅）。z 分数以滚动均值为中心、多空对称，持有期内的向上漂移对做空利润一方不利。冻结参数样本内（保守口径）做空利润 {int(side.at[-1, 'size'])} 笔、净盈亏合计 {side.at[-1, 'sum']:,.0f} 元/单位；做多利润 {int(side.at[1, 'size'])} 笔、合计 {side.at[1, 'sum']:,.0f} 元/单位。
+
 ## 7 样本外（{day(OOS_START)} 至 {day(last)}，冻结参数，只跑一次）
 
 参数：窗口 {P['window']}、开仓 {P['entry']:g}、平仓 {P['exit']:g}、止损 {P['entry'] * P['stop_mult']:g}，冷静期、换月、方向性平仓均开启。样本外从空仓开始。
@@ -273,17 +294,19 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 保守口径、1 跳：样本外年化收益 {pct(po.ann_ret)}，夏普 {num(po.sharpe)}，最大回撤 {pct(po.mdd)}，{int(po.n)} 笔交易；同参数样本内夏普 {num(pc.sharpe)}。乐观口径样本外夏普 {num(pco.sharpe)}。
 
+两种口径的信号完全相同，差别只在成交价。样本外 {len(mg)} 笔交易的毛盈亏，乐观口径合计 {mg['pnl_c'].sum():,.0f} 元/单位，保守口径 {mg['pnl_o'].sum():,.0f} 元/单位，差 {gd.sum():,.0f}；其中 {day(kd)} 发出信号的那笔差 {gd[k]:,.0f}，当晚在持组 S 从收盘 {s_jump[0]:,.0f} 元跳到次日开盘 {s_jump[1]:,.0f} 元。去掉这一笔，两种口径毛盈亏差 {gd.sum() - gd[k]:,.0f} 元/单位。
+
 样本外交易（保守口径、1 跳）：
 
-{table(oos_t.assign(side=oos_t.side.map({1: '做多利润', -1: '做空利润'})).set_index('open_exec').rename_axis('开仓成交日')[['side', 'close_exec', 'reason', 'z_open', 'z_close', 'hold_days', 'rolls', 'net']].rename(columns={'side': '方向', 'close_exec': '平仓成交日', 'reason': '平仓原因', 'z_open': '开仓z', 'z_close': '平仓z', 'hold_days': '持仓天数', 'rolls': '换月', 'net': '净盈亏(元/单位)'}), {'开仓z': num, '平仓z': num, '净盈亏(元/单位)': lambda v: f'{v:,.0f}'}) if len(oos_t) else '（无交易）'}
+{table(oos_t.assign(side=oos_t.side.map({1: '做多利润', -1: '做空利润'}), open_exec=oos_t.open_exec.map(day), close_exec=oos_t.close_exec.map(day)).set_index('open_exec').rename_axis('开仓成交日')[['side', 'close_exec', 'reason', 'z_open', 'z_close', 'hold_days', 'rolls', 'net']].rename(columns={'side': '方向', 'close_exec': '平仓成交日', 'reason': '平仓原因', 'z_open': '开仓z', 'z_close': '平仓z', 'hold_days': '持仓天数', 'rolls': '换月', 'net': '净盈亏(元/单位)'}), {'开仓z': num, '平仓z': num, '净盈亏(元/单位)': lambda v: f'{v:,.0f}'}) if len(oos_t) else '（无交易）'}
 
 ![样本外净值](fig/equity_oos.png)
 
 ## 8 实盘视角
 
-**三腿同步成交**：MA 在郑商所，L、PP 在大商所，三腿无法用一张组合单成交，只能分腿下单，先成交的腿要承担其余腿的价格变动。日线数据量化不了盘中分腿的风险，只能给出两个参照：样本内在持组合约的价差从前一日收盘到次日开盘的跳动绝对值中位数 {lv['gap_med']:,.0f} 元/单位、90% 分位 {lv['gap_p90']:,.0f} 元，同期 {W0} 日滚动 σ 中位数 {lv['sd_med']:,.0f} 元；冻结参数下保守口径与乐观口径的样本内夏普分别为 {num(row(c_is, fill='open', ticks=1).sharpe)} 和 {num(row(c_is, fill='close', ticks=1).sharpe)}，差值反映成交时点晚半天的代价。
+**三腿同步成交**：MA 在郑商所，L、PP 在大商所，三腿无法用一张组合单成交，只能分腿下单，先成交的腿要承担其余腿的价格变动。日线数据量化不了盘中分腿的风险，只能给出两个参照：样本内在持组合约的价差从前一日收盘到次日开盘的跳动绝对值中位数 {lv['gap_med']:,.0f} 元/单位、90% 分位 {lv['gap_p90']:,.0f} 元，同期 {W0} 日滚动 σ 中位数 {lv['sd_med']:,.0f} 元；冻结参数下保守、乐观口径的夏普，样本内为 {num(pc.sharpe)} 和 {num(row(c_is, fill='close', ticks=1).sharpe)}，样本外为 {num(po.sharpe)} 和 {num(pco.sharpe)}。样本外的差距主要来自第 7 节那一次隔夜跳空。信号在收盘产生，实盘要按接近收盘的价格成交，只能在收盘前几分钟用盘中价格算信号并三腿同时下单，成交价介于两种口径之间，还要承担分腿风险。
 
-**保证金**：按 {MARGIN:.0%} 计，1 单位保证金中位数约 {lv['margin_med']/1e4:.2f} 万元。冻结参数样本内（保守口径）单笔交易持仓期间最大浮亏中位数为保证金的 {pct(lv['mae_med'])}，最差一笔为 {pct(lv['mae_worst'])}。实盘还要留出交易所临近交割月上调保证金和期货公司加收的部分；换月规则让持仓不进入交割月前一个月，避开了临近交割的保证金上调。
+**保证金**：按 {MARGIN:.0%} 计，1 单位保证金中位数约 {lv['margin_med']/1e4:.2f} 万元。冻结参数样本内（保守口径）单笔交易持仓期间最大浮亏占保证金的比例，中位数 {pct(-lv['mae_med'])}，最差一笔 {pct(-lv['mae_worst'])}。实盘还要留出交易所临近交割月上调保证金和期货公司加收的部分；换月规则让持仓不进入交割月前一个月，避开了临近交割的保证金上调。
 
 **流动性**：样本内在持合约日成交量中位数 L {lv['vol_med']['L']:,.0f} 手、PP {lv['vol_med']['PP']:,.0f} 手、MA {lv['vol_med']['MA']:,.0f} 手；换月当天新组合约的成交量中位数 L {lv['vol_roll']['L']:,.0f}、PP {lv['vol_roll']['PP']:,.0f}、MA {lv['vol_roll']['MA']:,.0f} 手。原脚本的下单量（100 手 L、100 手 PP、300 手 MA）分别占上述日成交量中位数的 {pct(lv['demo_share']['L'], 2)}、{pct(lv['demo_share']['PP'], 2)}、{pct(lv['demo_share']['MA'], 2)}。日成交量只说明全天容量，开盘和夜盘开盘时点的盘口深度需要逐笔数据另行评估。
 
@@ -295,7 +318,9 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 **局限**：
 - 只有日线，信号每天判断一次，盘中触发、分腿成交、冲击成本都没有模拟；滑点按固定跳数假设，没有盘口数据校准。
 - 手续费按名义额万分之一估计，与各期货公司实际费率不同；成本敏感性表给出 0、1、2 跳的结果。
-- 10 吨/手的 MA 合约 2014 年 6 月才上市，样本内从 {day(IS_START)} 开始，前几个月在持的 MA 合约还不是全市场主力（当时主力是 50 吨/手的老合约，不在数据里）。
+- 10 吨/手的 MA 合约 2014 年 6 月才上市，早期组合约的 L、PP 腿成交稀少，样本内从 {day(IS_START)} 开始，只有约 10 年。
+- 换月规则按当时持仓量最大的可选组换，样本内有 {rolls['n_odd']} 次先换到非 01/05/09 月份、几周内再换一次（第 2 节）；这一点在样本外运行后才发现，没有改。
+- ③ 的窗口规则在看过样本内网格后改过一次（第 5 节）。
 - 样本外约 {R['oos_years']:.1f} 年，交易 {int(po.n)} 笔，统计意义有限。
 - 选参只看夏普一个指标，邻域取平均的规则本身也是一种选择。
 
@@ -313,12 +338,19 @@ pytest -q                # 数据层与回测引擎测试
 
 
 def conclusions(R, v0c, fsh, far, gi, P, pc, po, same):
-    out = []
-    out.append(f"1. 原版逻辑在样本内扣除 1 跳成本后（保守口径）年化收益 {pct(v0c.ann_ret)}、夏普 {num(v0c.sharpe)}，"
-               f"{'不具备可交易的收益' if v0c.sharpe < 0.5 else '有一定收益'}。")
-    out.append(f"2. 四处修正累加后（v4，保守口径）夏普由 {num(fsh[0])} {up_down(fsh[0], fsh[-1])} {num(fsh[-1])}，"
-               f"年化收益由 {pct(far[0])} 变为 {pct(far[-1])}。各步贡献见第 5 节表格。")
-    out.append(f"3. 参数网格保守口径 36 格中 {int((gi['sharpe'] > 0).sum())} 格夏普为正；按邻域平均选出的参数样本内夏普 {num(pc.sharpe)}。")
-    out.append(f"4. 冻结参数在样本外（保守口径、1 跳）夏普 {num(po.sharpe)}、年化收益 {pct(po.ann_ret)}、{int(po.n)} 笔交易，"
-               f"{'方向与样本内一致' if np.sign(po.ann_ret) == np.sign(pc.ann_ret) else '与样本内方向相反'}。")
+    names = list(R['fix'][0]['version'].unique())
+    k = int(np.argmax(np.diff(fsh))) + 1
+    pco = row(R['oos'][0], fill='close', ticks=1)
+    st = R['stat']
+    out = [f"1. 原版逻辑在样本内扣除 1 跳成本后（保守口径）年化收益 {pct(v0c.ann_ret)}、夏普 {num(v0c.sharpe)}、最大回撤 {pct(v0c.mdd)}，"
+           f"{'没有可交易的收益' if v0c.sharpe < 0.5 else '有一定收益'}；主要亏损来自不换月时在交割月前一个月及交割月的持仓（第 4 节第 2 条）。",
+           f"2. 四处修正累加后（v4，保守口径）夏普由 {num(fsh[0])} 变为 {num(fsh[-1])}，年化收益由 {pct(far[0])} 变为 {pct(far[-1])}；"
+           f"单步夏普提高最多的是 {names[k]}（{num(fsh[k - 1])}→{num(fsh[k])}）。",
+           f"3. 参数网格保守口径 36 格中 {int((gi['sharpe'] > 0).sum())} 格夏普为正、中位数 {num(gi['sharpe'].median())}；"
+           f"按邻域平均选出的参数样本内夏普 {num(pc.sharpe)}，只有 {int(pc.n)} 笔交易。",
+           f"4. 冻结参数在样本外保守口径（1 跳）夏普 {num(po.sharpe)}、年化收益 {pct(po.ann_ret)}，乐观口径夏普 {num(pco.sharpe)}，"
+           f"共 {int(po.n)} 笔交易；两种口径的差距基本来自一次隔夜跳空（第 7 节）。",
+           f"5. 去掉换月跳空后的连续价差 ADF p 值 {st['adj_p']:.2f}、半衰期 {st['adj_hl']:.0f} 个交易日，远月组价差系统性低于近月组；"
+           + ("在这些条件下，这个 z 分数均值回归策略修正后的样本内夏普不高、样本外保守口径没有正收益，现有证据不支持实盘。"
+              if pc.sharpe < 0.5 and po.sharpe < 0.5 else "策略收益需要结合上面的弱平稳性一起看。")]
     return '\n'.join(out) + '\n'

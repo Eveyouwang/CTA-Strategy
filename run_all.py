@@ -42,6 +42,7 @@ def main():
     R['live'] = A.live(lab, R['cost_is'][1])
     R['rolls'] = A.roll_stats(lab)
     R['early'] = A.early_liquidity(lab)
+    R['ts'] = A.term_structure(lab)
 
     out = A.REPORT
     R['orig'][1].to_csv(out / 'trades_original.csv', index=False)

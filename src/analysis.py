@@ -203,7 +203,20 @@ def roll_stats(lab):
     tab = pd.DataFrame({'date': sw, 'from': old.to_numpy(), 'to': cal.loc[sw].to_numpy(), 'lead_days': lead})
     tab = tab.join(lab.mkt.codes.add_prefix('to_'), on='to')
     ins = (tab.date >= IS_START) & (tab.date <= IS_END)
-    return dict(n_is=int(ins.sum()), lead_med=float(np.median(lead[ins])), table=tab)
+    odd = ins & ~tab['to'].str[4:].isin(['01', '05', '09'])  # 换到非 01/05/09 月份
+    lag = dates.searchsorted(tab.date.shift(-1)[odd]) - dates.searchsorted(tab.date[odd])
+    return dict(n_is=int(ins.sum()), lead_med=float(np.median(lead[ins])), table=tab,
+                n_odd=int(odd.sum()), lag_min=int(lag.min()), lag_max=int(lag.max()))
+
+
+def term_structure(lab, start=IS_START, end=IS_END):
+    """换月日新组与旧组同日收盘 S 之差（新 − 旧），以及在持组原始 S 的首末值。"""
+    S, cal = lab.mkt.S_close, lab.cal['roll']
+    c = cal.loc[start:end]
+    sw = c.index[(c != c.shift()) & c.shift().notna()]
+    gap = pd.Series([S.at[d, n] - S.at[d, o] for d, o, n in zip(sw, cal.shift(1).loc[sw], c.loc[sw])], index=sw)
+    raw = pick(S, cal).loc[start:end]
+    return dict(n=len(gap), gap_mean=gap.mean(), gap_neg=(gap < 0).mean(), raw0=raw.iloc[0], raw1=raw.iloc[-1])
 
 
 def early_liquidity(lab, start='20141201', end=IS_START):
@@ -211,7 +224,7 @@ def early_liquidity(lab, start='20141201', end=IS_START):
     mkt, cal = lab.mkt, lab.cal['roll']
     days = cal.loc[start:end].index[:-1]
     v = {l: pick(mkt.vol[l], cal).loc[days] for l in LEGS}
-    return dict(months=sorted(set(cal.loc[days])), vol={l: s.median() for l, s in v.items()},
+    return dict(months=sorted(set(cal.loc[days])), last=days[-1], vol={l: s.median() for l, s in v.items()},
                 zero_days=int((sum(s == 0 for s in v.values()) > 0).sum()), n=len(days))
 
 
@@ -228,7 +241,8 @@ def live(lab, runs, start=IS_START, end=IS_END):
     return dict(gap_med=gap.median(), gap_p90=gap.quantile(0.9), sd_med=sd.median(),
                 notional_med=notional.median(), margin_med=MARGIN * notional.median(),
                 cost_side_med=pick(unit_cost(mkt, mkt.close, 1), cal).loc[start:end].median(),
-                slip_side=pick(unit_cost(mkt, mkt.close, 1) - unit_cost(mkt, mkt.close, 0), cal).loc[start:end].median(),
+                slip_before=sum(LOTS[l] * mkt.unit[l] * mkt.tick[l].loc[start].iloc[0] for l in LEGS),
+                slip_after=sum(LOTS[l] * mkt.unit[l] * mkt.tick[l].loc[end].iloc[0] for l in LEGS),
                 mae_med=(t.mae / t.margin).median(), mae_worst=(t.mae / t.margin).min(),
                 vol_med={l: v.median() for l, v in vol.items()},
                 vol_roll={l: v.loc[sw].median() for l, v in vol.items()},
