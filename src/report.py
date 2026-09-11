@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from .analysis import DEMO, ENTRIES, EXITS, FILLS, MAIN_MONTHS, REPORT, W0, WINDOWS  # noqa: E402
+from .analysis import DEMO, ENTRIES, EXITS, FILLS, MAIN_MONTHS, REPORT, W0, WINDOWS, calendar_diff  # noqa: E402
 from .backtest import FEE, MARGIN  # noqa: E402
 from .data import L_TICK5_BEFORE, pick  # noqa: E402
 
@@ -149,6 +149,12 @@ def figures(R, R1):
 
 
 # ---------- 正文 ----------
+def same_oos(R1, R2):
+    """两轮样本外（所有成交口径与滑点档）的交易明细和逐日收益是否完全相同。"""
+    return all(R1['oos'][1][k][1].equals(R2['oos'][1][k][1]) and R1['oos'][1][k][0]['ret'].equals(R2['oos'][1][k][0]['ret'])
+               for k in R2['oos'][1])
+
+
 def round1_section(R1, R2):
     o, f, ci, co, P1 = R1['orig'][0], R1['fix'][0], R1['cost_is'][0], R1['oos'][0], R1['params']
     v4 = f['version'].iloc[-1]
@@ -162,6 +168,18 @@ def round1_section(R1, R2):
     t1 = pd.DataFrame(rows).set_index('结果')
     r1, r2 = R1['r'], R2['r']
     lag = R1['rolls']['lag']
+    p2 = R2['params']
+    same_p = all(P1[k] == p2[k] for k in ('window', 'entry', 'exit'))
+    same = same_oos(R1, R2)
+    cd = calendar_diff(R1, R2)
+    if cd['n']:
+        cal_txt = (f"样本外期间两轮的换月日历有 {cd['n']} 个交易日不同（{day(cd['first'])} 至 {day(cd['last'])}，第一轮在持 "
+                   f"{'、'.join(cd['m1'])} 组，第二轮在持 {'、'.join(cd['m2'])} 组），这些天两轮{'都空仓' if not cd['held'] else '有仓位'}")
+    else:
+        cal_txt = '样本外期间两轮的换月日历完全相同'
+    after = ((f"第二轮按同一选参规则在新样本内选出的参数与第一轮相同（窗口 {p2['window']}、开仓 {p2['entry']:g}、平仓 {p2['exit']:g}）。"
+              if same_p else f"第二轮选出的参数为窗口 {p2['window']}、开仓 {p2['entry']:g}、平仓 {p2['exit']:g}。")
+             + f"{cal_txt}。" + ("所以第二轮样本外交易与第一轮逐笔相同，第二轮的修改没有改变样本外结果。" if same else ''))
     return f"""## 1 两轮说明与第一轮结果
 
 第一轮按任务书的顺序完成：只用样本内（{day(r1.is_start)} 至 {day(r1.is_end)}）选参，单独提交冻结参数 `report/round1/params.json`，再在样本外只跑一次。这是本项目唯一一次干净的样本外检验。第一轮冻结参数为窗口 {P1['window']}、开仓 {P1['entry']:g}、平仓 {P1['exit']:g}，结果（1 跳成本；保守＝次日开盘成交，乐观＝信号日收盘成交）：
@@ -179,6 +197,8 @@ def round1_section(R1, R2):
 | ③ 窗口 | 不超过半衰期的最大网格窗口，{R1['w3']} 天 | 半衰期取整；在持组自有历史不够时取样本内每天都算得出 z 的最长窗口，{R2['w3']} 天 | 第一轮这条规则是看过样本内网格之后改的 |
 
 成本、成交口径、网格、选参规则、止损倍数、冷静期、方向性平仓都没变。第二轮的设计在跑之前写进 PROGRESS.md，冻结参数 `report/round2/params.json` 在样本内选定后单独提交，之后才首次运行第二轮样本外。但这三处修改是在看过第一轮样本外之后做的，{day(r2.oos_start)} 以后的数据对第二轮已经不是独立检验，第二轮样本外只作参考；要检验第二轮，需要 {day(R2['lab'].mkt.dates[-1])} 以后的新数据。
+
+{after}
 
 以下第 2–10 节均为第二轮。
 """
@@ -215,10 +235,11 @@ def write(R, R1, meta):
     side = ti.groupby('side')['net'].agg(['size', 'sum']).reindex([-1, 1]).fillna(0)
     oos_t = R['oos'][1]['open', 1][1]
     mg = R['oos'][1]['close', 1][1].merge(oos_t, on='open_signal', suffixes=('_c', '_o'))
-    gap_txt = ''
+    gap_txt, one_jump = '', False
     if len(mg):
         gd = mg['pnl_c'] - mg['pnl_o']
         k = gd.abs().idxmax()
+        one_jump = abs(gd[k]) >= 0.8 * abs(gd.sum())
         kd, km = mg.at[k, 'open_signal'], mg.at[k, 'month_c']
         s0, s1 = mkt.S_close.at[kd, km], mkt.S_open.iat[mkt.dates.searchsorted(kd) + 1, mkt.months.index(km)]
         gap_txt = (f"两种口径的信号完全相同，差别只在成交价。样本外 {len(mg)} 笔交易的毛盈亏，乐观口径合计 {mg['pnl_c'].sum():,.0f} 元/单位，"
@@ -231,6 +252,14 @@ def write(R, R1, meta):
         v3_txt = f"样本内连续价差半衰期取整为 {R['w_hl']} 天，在持组自有历史最短 {R['w_hist']} 天，够用，取 {R['w3']} 天"
     ev = meta['ticks']
     tl = '\n'.join(f'| {d} | {e} | {s} |' for d, e, s in TIMELINE)
+    same_o = same_oos(R1, R)
+    reent = ('在这段样本里，止损出场后按原方向重开整体是赚钱的，说明止损之后价差多数又回归了；第 6 节加冷静期后夏普下降，主要来自去掉了这些交易。'
+             if d_c['reentry_net'] > 0 else '')
+    same_v34 = fx[names[-1]][list(COLS)].equals(fx[names[-2]][list(COLS)])
+    v34_txt = (f"{names[-1]} 与 {names[-2]} 结果完全相同：两种平仓规则只在持仓期间 z 越过均值到另一侧 0.5 以外时才有差别，"
+               "样本内没有出现这种情况。" if same_v34 else '')
+    oos_cmp = ('两轮样本外交易逐笔相同（原因见第 1 节），这组数也就是第一轮那次干净检验的结果。' if same_o else
+               f"同一段样本外，第一轮（干净的检验）保守口径夏普 {num(q1.sharpe)}、年化 {pct(q1.ann_ret)}，乐观口径夏普 {num(q1c.sharpe)}。")
     oos_tab = (oos_t.assign(side=oos_t.side.map({1: '做多利润', -1: '做空利润'}), open_exec=oos_t.open_exec.map(day),
                             close_exec=oos_t.close_exec.map(day)).set_index('open_exec').rename_axis('开仓成交日')
                [['side', 'close_exec', 'reason', 'z_open', 'z_close', 'hold_days', 'rolls', 'net']]
@@ -273,9 +302,9 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 |---|---|---|
 {tl}
 
-在 2019-03-29 之前，甲醇有夜盘而聚乙烯、聚丙烯没有；2019-03-29 至 2019-12-11 甲醇夜盘比另两腿多半小时。这两段时间里，保守口径用的次日开盘价，三条腿不是同一时刻的价格，隔夜消息也先反映在甲醇上。第二轮样本内从 {day(r.is_start)} 开始，此后三个合约的交易规则只有聚乙烯跳价一处变化（已按时间计入成本）；期货法施行当天没有改这三个合约的交易规则，大商所据此修订交易规则的公告在 2026 年 1 月，已在样本外期间。起点附近的滚动窗口会用到起点之前这组合约自己的价格，只作指标预热，交易、平稳性检验、网格与选参都从起点算。
+2019-03-29 之前甲醇有夜盘而聚乙烯、聚丙烯没有：保守口径用的次日开盘价，甲醇是前一晚 21:00 的价格，另两腿是次日 9:00 的价格，不是同一时刻，隔夜消息先反映在甲醇上。2019-03-29 至 2019-12-11 三腿都从 21:00 开盘，但甲醇夜盘多交易半小时，23:00–23:30 的消息只反映在甲醇上。第二轮样本内从 {day(r.is_start)} 开始，此后三个合约的交易规则只有聚乙烯跳价一处变化（已按时间计入成本）；期货法施行当天没有改这三个合约的交易规则，大商所据此修订交易规则的公告在 2026 年 1 月，已在样本外期间。起点附近的滚动窗口会用到起点之前这组合约自己的价格，只作指标预热，交易、平稳性检验、网格与选参都从起点算。
 
-**换月**：三腿用同一交割月，只在 {'、'.join(MAIN_MONTHS)} 三个月份里选。每天在候选组里选前一交易日 MA 持仓量最大的那组，只向后换；某组合约在「交割月前一个月的首个交易日」之前 3 个交易日起不再选用，收盘成交和次日开盘成交两种口径都能在交割月前一个月之前换完。换月当天平旧开新，两边都计成本。第二轮样本内换月 {rolls['n_is']} 次，换月日距交割月前一个月首日的交易日数中位数为 {rolls['lead_med']:.0f} 天，换到非 01/05/09 月份 {rolls['n_odd']} 次。
+**换月**：三腿用同一交割月，只在 {'、'.join(MAIN_MONTHS)} 三个月份里选。每天在候选组里选前一交易日 MA 持仓量最大的那组，只向后换；某组合约在「交割月前一个月的首个交易日」之前 3 个交易日起不再选用，收盘成交和次日开盘成交两种口径都能在交割月前一个月之前换完。换月当天平旧开新，两边都计成本。第二轮样本内换月 {rolls['n_is']} 次，换月日距交割月前一个月首日的交易日数中位数为 {rolls['lead_med']:.0f} 天{'，多数换月在截止日触发' if rolls['lead_med'] <= 2 else ''}，换到非 01/05/09 月份 {rolls['n_odd']} 次。
 
 **μ、σ 的算法**：每组合约只用它自己过去 w 天的 S。换月当天的 z 用新组合约过去 w 天的 S 算，不用「旧组历史接新组当日」的拼接序列，避免换月跳空伪造信号。`tests/test_data.py` 对此有专门测试。
 
@@ -304,7 +333,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 以下定量都取原版在第二轮样本内的结果（1 跳成本），括号前为保守口径，括号内为乐观口径。
 
-1. **止损后没有冷静期**。止损把 `in_position` 置为 False 后，下一次判断时 z 往往仍在 ±2 以外，会按原方向立刻重开。样本内止损 {d_c['n_stop']} 次（{d_o['n_stop']} 次），其中止损次日同方向重开 {d_c['n_reentry']} 次（{d_o['n_reentry']} 次），这些重开交易净盈亏合计 {d_c['reentry_net']:,.0f} 元/单位（{d_o['reentry_net']:,.0f}），胜率 {pct(d_c['reentry_win'])}（{pct(d_o['reentry_win'])}）。原脚本在盘中每个 tick 都判断，重开可能发生在止损后的下一个 tick，日线回测看不到这一层。
+1. **止损后没有冷静期**。止损把 `in_position` 置为 False 后，下一次判断时 z 往往仍在 ±2 以外，会按原方向立刻重开。样本内止损 {d_c['n_stop']} 次（{d_o['n_stop']} 次），其中止损次日同方向重开 {d_c['n_reentry']} 次（{d_o['n_reentry']} 次），这些重开交易净盈亏合计 {d_c['reentry_net']:,.0f} 元/单位（{d_o['reentry_net']:,.0f}），胜率 {pct(d_c['reentry_win'])}（{pct(d_o['reentry_win'])}）。{reent}原脚本在盘中每个 tick 都判断，重开可能发生在止损后的下一个 tick，日线回测看不到这一层。
 2. **不换月**。合约写死，到期前一个多月流动性已转到下一个合约，临近交割月交易所分段提高保证金，个人客户的持仓不能进入交割月。样本内有仓位的 {d_c['held_days']} 天中，有 {d_c['late_days']} 天落在交割月前一个月或交割月（其中交割月 {d_c['deliv_days']} 天），这些天的净盈亏合计 {d_c['late_net']:,.0f} 元/单位（{d_o['late_net']:,.0f}），全部持仓日合计 {d_c['total_net']:,.0f}（{d_o['total_net']:,.0f}）；这些天在持 MA 合约日成交量中位数 {d_c['vol_late']:,.0f} 手，其余持仓日为 {d_c['vol_normal']:,.0f} 手。到期强平 {d_c['n_expiry']} 次。
 3. **平仓条件不分方向**。平仓要求 |z| < 0.5。如果做空后 z 一天内从 2 以上跌到 −0.5 以下，价差已越过均值，脚本仍持仓，要等 z 回到 ±0.5 以内才平，而持空的止损只看 z > 3。样本内有 {d_c['n_overshoot']} 笔交易（{d_o['n_overshoot']} 笔）在持仓期间出现过 z 越过均值到另一侧 0.5 以外仍未平仓。另外平仓阈值取 0 时 |z| < 0 永远不成立，网格里测平仓阈值 0 需要改成方向性判断。
 4. **窗口 {W0} 天与价差回归速度对不上**。样本内去掉换月跳空后的连续价差，AR(1) 半衰期为 {st['adj_hl']:.1f} 个交易日，ADF 检验 p 值 {st['adj_p']:.2f}；每组合约在持期内单独估计，半衰期中位数 {st['per']['hl'].median():.1f} 天，{len(st['per'])} 组里 {int((st['per']['p'] < 0.05).sum())} 组 ADF 在 5% 水平拒绝单位根。
@@ -322,7 +351,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 {mtable(fx_tab, ['version', 'fill'], '版本 / 成交')}
 
-保守口径逐步变化：""" + '；'.join(steps) + f"""。
+保守口径逐步变化：""" + '；'.join(steps) + f"""。{v34_txt}
 
 ![各版本净值](fig/equity_versions.png)
 
@@ -362,7 +391,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 {mtable(c_oos, ['fill', 'ticks'], '成交 / 滑点跳数')}
 
-保守口径、1 跳：第二轮样本外年化收益 {pct(po.ann_ret)}，夏普 {num(po.sharpe)}，最大回撤 {pct(po.mdd)}，{int(po.n)} 笔交易；同参数样本内夏普 {num(pc.sharpe)}；乐观口径样本外夏普 {num(pco.sharpe)}。同一段样本外，第一轮（干净的检验）保守口径夏普 {num(q1.sharpe)}、年化 {pct(q1.ann_ret)}，乐观口径夏普 {num(q1c.sharpe)}。
+保守口径、1 跳：第二轮样本外年化收益 {pct(po.ann_ret)}，夏普 {num(po.sharpe)}，最大回撤 {pct(po.mdd)}，{int(po.n)} 笔交易；同参数样本内夏普 {num(pc.sharpe)}；乐观口径样本外夏普 {num(pco.sharpe)}。{oos_cmp}
 
 {gap_txt}
 
@@ -382,7 +411,7 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 ## 10 结论与局限
 
-""", conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, q1c), f"""
+""", conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same_o, one_jump, edge), f"""
 **局限**：
 - 第二轮的三处修改在看过第一轮样本外之后做出，第二轮样本外不是独立检验；独立检验只有第一轮那一次。
 - 第二轮样本内约 {R['is_years']:.1f} 年，冻结参数只有 {int(pc.n)} 笔交易；样本外约 {R['oos_years']:.1f} 年、{int(po.n)} 笔，统计意义有限。
@@ -404,19 +433,33 @@ pytest -q                # 数据层与回测引擎测试
     (REPORT / 'report.md').write_text(''.join(s))
 
 
-def conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, q1c):
-    st = R['stat']
+def conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same, one_jump, edge):
+    st, st1 = R['stat'], R1['stat']
+    v0_1 = row(R1['orig'][0], scope='full_is', fill='open', ticks=1)
+    pc1 = row(R1['cost_is'][0], fill='open', ticks=1)
     sh = [fx[n].sharpe for n in names]
-    k = int(np.argmax(np.diff(sh))) + 1
-    weak = pc.sharpe < 0.5 and po.sharpe < 0.5 and q1.sharpe < 0.5
-    out = [f"1. 原版逻辑在第二轮样本内扣除 1 跳成本后（保守口径）年化收益 {pct(v0c.ann_ret)}、夏普 {num(v0c.sharpe)}、最大回撤 {pct(v0c.mdd)}。",
-           f"2. 四处修正累加后（v4，保守口径）夏普由 {num(sh[0])} 变为 {num(sh[-1])}，年化收益由 {pct(fx[names[0]].ann_ret)} 变为 "
-           f"{pct(fx[names[-1]].ann_ret)}；单步夏普提高最多的是 {names[k]}（{num(sh[k - 1])}→{num(sh[k])}）。",
-           f"3. 参数网格保守口径 36 格中 {int((gi['sharpe'] > 0).sum())} 格夏普为正、中位数 {num(gi['sharpe'].median())}；"
-           f"按邻域平均选出的参数样本内夏普 {num(pc.sharpe)}，{int(pc.n)} 笔交易。",
-           f"4. 样本外保守口径（1 跳）：第一轮（唯一一次干净的检验）夏普 {num(q1.sharpe)}、年化 {pct(q1.ann_ret)}；第二轮（这段数据已看过）"
-           f"夏普 {num(po.sharpe)}、年化 {pct(po.ann_ret)}，乐观口径 {num(pco.sharpe)}。",
-           f"5. 第二轮样本内去掉换月跳空的连续价差 ADF p 值 {st['adj_p']:.2f}、半衰期 {st['adj_hl']:.0f} 个交易日。"
-           + ("两轮的样本内、样本外夏普都不到 0.5，这个 z 分数均值回归策略现有证据不支持实盘。" if weak
-              else "第二轮的样本外表现只能作参考，需要用之后的新数据检验。")]
+    down = sh[-1] < sh[0]
+    strong = st['adj_p'] < 0.05 <= st1['adj_p']
+    weak = max(pc.sharpe, po.sharpe, pc1.sharpe, q1.sharpe) < 0.5
+    out = [
+        f"1. 原版逻辑在第二轮样本内（三腿交易时段一致之后）扣除 1 跳成本（保守口径）年化收益 {pct(v0c.ann_ret)}、夏普 {num(v0c.sharpe)}、"
+        f"最大回撤 {pct(v0c.mdd)}；第一轮样本内（{day(R1['r'].is_start)} 起）同一口径夏普 {num(v0_1.sharpe)}。",
+        f"2. 四处修正累加后（v4，保守口径）夏普由 {num(sh[0])} {'降' if down else '升'}至 {num(sh[-1])}，年化收益由 "
+        f"{pct(fx[names[0]].ann_ret)} 变为 {pct(fx[names[-1]].ann_ret)}。"
+        + (f"下降主要在①止损冷静期这一步（夏普 {num(sh[0])}→{num(sh[1])}，最大回撤 {pct(fx[names[0]].mdd)}→{pct(fx[names[1]].mdd)}）："
+           f"原版止损后次日同向重开的 {d_c['n_reentry']} 笔交易合计净赚 {d_c['reentry_net']:,.0f} 元/单位，冷静期把它们去掉了。"
+           if down and sh[1] < sh[0] and d_c['reentry_net'] > 0 else ''),
+        f"3. 参数网格保守口径 36 格中 {int((gi['sharpe'] > 0).sum())} 格夏普为正、中位数 {num(gi['sharpe'].median())}；"
+        f"按邻域平均选出的参数（窗口 {P['window']}、开仓 {P['entry']:g}、平仓 {P['exit']:g}）样本内夏普 {num(pc.sharpe)}，"
+        f"只有 {int(pc.n)} 笔交易" + (f"，处在网格边上（{'、'.join(edge)}）" if edge else '') + "。",
+        f"4. 样本外保守口径（1 跳）夏普 {num(po.sharpe)}、年化收益 {pct(po.ann_ret)}，乐观口径夏普 {num(pco.sharpe)}，共 {int(po.n)} 笔交易"
+        + ("；两种口径的差距基本来自一次隔夜跳空（第 8 节）" if one_jump else '') + "。"
+        + ("两轮样本外逐笔相同，这就是第一轮那次干净检验的结果。" if same
+           else f"第一轮（唯一一次干净的检验）保守口径夏普 {num(q1.sharpe)}。"),
+        f"5. 第二轮样本内去掉换月跳空的连续价差 ADF p 值 {st['adj_p']:.3f}、半衰期 {st['adj_hl']:.0f} 个交易日"
+        f"（第一轮样本内为 {st1['adj_p']:.2f}、{st1['adj_hl']:.0f} 天）"
+        + ("，三腿交易时段一致之后价差的均值回归证据明显更强；但 " if strong else "。")
+        + ("z 分数规则两轮的样本内、样本外保守口径夏普都不到 0.5" + ("，样本外保守口径没有正收益" if po.ann_ret <= 0 else '')
+           + "，现有证据不支持实盘。" if weak else "第二轮的样本外表现只能作参考，需要用之后的新数据检验。"),
+    ]
     return '\n'.join(out) + '\n'

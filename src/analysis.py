@@ -263,6 +263,16 @@ def term_structure(lab):
     return dict(n=len(gap), gap_mean=gap.mean(), gap_neg=(gap < 0).mean(), raw0=raw.iloc[0], raw1=raw.iloc[-1])
 
 
+def calendar_diff(R1, R2):
+    """样本外期间两轮换月日历不同的交易日，以及这些天两轮（1 跳，两种成交口径）是否有仓位。"""
+    s = R2['r'].oos_start
+    c1, c2 = R1['lab'].cal['roll'].loc[s:], R2['lab'].cal['roll'].loc[s:]
+    d = c1.index[(c1 != c2).to_numpy()]
+    held = any((R['oos'][1][f, 1][0].loc[d, 'pos'] != 0).any() for R in (R1, R2) for f in FILLS)
+    return dict(n=len(d), first=d.min() if len(d) else None, last=d.max() if len(d) else None,
+                m1=sorted(set(c1[d])), m2=sorted(set(c2[d])), held=held)
+
+
 def live(lab, runs):
     """隔夜跳空、名义额与保证金、单边成本、持仓期最大浮亏、在持合约成交量。"""
     start, end = lab.r.is_start, lab.r.is_end
