@@ -3,6 +3,7 @@
 python run_all.py
 两轮的样本外都只读取各自 report/roundN/params.json 的冻结参数，不在这里重新选参。
 """
+import hashlib
 import json
 import time
 
@@ -21,8 +22,9 @@ SHA256 = {  # 任务 0 记录的 data/ 文件指纹
 ROUND1_SHA256 = {  # 第一轮首次运行时入库的冻结参数与样本外结果，重算必须逐字节一致
     'params.json': 'f84c3a26c4acddb329ed99b9dcbe1e61ef31a269d8fec58a2d6fb8886d051a73',
     'metrics_oos.csv': 'dc29649a5ef6e2cfbcf0ced029209699cf35931f9d9694eb9998beec67314fb6',
-    'trades_oos.csv': '21ad6d3f000b2c9582563af5ffba8333d2f80fb1ad466984510e47c0e409d7bb',
 }
+# 交易明细在第三轮多了一列手数（前两轮恒为 1）；去掉该列后必须与首次运行入库的文件一致
+ROUND1_TRADES_SHA256 = '21ad6d3f000b2c9582563af5ffba8333d2f80fb1ad466984510e47c0e409d7bb'
 
 
 def run_round(r, mkt):
@@ -52,13 +54,35 @@ def run_round(r, mkt):
     out = r.out
     out.mkdir(parents=True, exist_ok=True)
     R['orig'][1].to_csv(out / 'trades_original.csv', index=False)
-    pd.concat([t.assign(fill=f, ticks=k) for (f, k), (_, t) in R['oos'][1].items()]).to_csv(
-        out / 'trades_oos.csv', index=False)
+    R['trades_oos'] = pd.concat([t.assign(fill=f, ticks=k) for (f, k), (_, t) in R['oos'][1].items()])
+    R['trades_oos'].to_csv(out / 'trades_oos.csv', index=False)
     R['rolls']['table'].to_csv(out / 'roll_calendar.csv', index=False)
     R['grid'].to_csv(out / 'grid_is.csv', index=False)
     R['orig'][0].to_csv(out / 'metrics_original.csv', index=False)
     R['fix'][0].to_csv(out / 'metrics_fixes.csv', index=False)
     R['oos'][0].to_csv(out / 'metrics_oos.csv', index=False)
+    return R
+
+
+def run_wf(mkt):
+    """第三轮：滚动检验（每个检验年只用它之前 3 年选参）× 三档风控。"""
+    lab = A.Lab(A.ROUND2, mkt)
+    vol = A.spread_vol(lab)
+    folds, runs, rows = [], {}, []
+    for v in A.VARIANTS:
+        f, r = A.walk_forward(lab, v, vol)
+        folds.append(f)
+        runs[v] = r
+        for scope, since in (('all', None), ('since2020', '2020')):
+            for fill, m in A.wf_summary(f, r, since=since).items():
+                rows.append(dict(variant=v, scope=scope, fill=fill, **m))
+    R = dict(lab=lab, folds=pd.concat(folds, ignore_index=True), runs=runs, metrics=pd.DataFrame(rows))
+    out = A.REPORT / 'round3'
+    out.mkdir(parents=True, exist_ok=True)
+    R['folds'].to_csv(out / 'folds.csv', index=False)
+    R['metrics'].to_csv(out / 'metrics_wf.csv', index=False)
+    pd.concat([runs[v]['open'][1] for v in A.VARIANTS]).to_csv(out / 'trades_wf.csv', index=False)
+    pd.DataFrame({v: 1 + runs[v]['open'][0]['ret'].cumsum() for v in A.VARIANTS}).to_csv(out / 'nav_wf.csv')
     return R
 
 
@@ -70,12 +94,15 @@ def main():
     R1 = run_round(A.ROUND1, mkt)
     got = {n: sha256(A.ROUND1.out / n) for n in ROUND1_SHA256}
     assert got == ROUND1_SHA256, f'第一轮重算结果与首次运行入库的不一致：{got}'
+    old = hashlib.sha256(R1['trades_oos'].drop(columns=['qty']).to_csv(index=False).encode()).hexdigest()
+    assert old == ROUND1_TRADES_SHA256, f'第一轮样本外交易明细（去掉手数列）与入库的不一致：{old}'
     R2 = run_round(A.ROUND2, mkt)
-    write(R2, R1, dict(sha=sha, summary=summary(), ticks=tick_evidence(), fills=fill_counts()))
+    R3 = run_wf(mkt)
+    write(R2, R1, R3, dict(sha=sha, summary=summary(), ticks=tick_evidence(), fills=fill_counts()))
 
     cols = ['ann_ret', 'mdd', 'sharpe', 'win', 'n', 'hold']
     pd.set_option('display.width', 200)
-    print('第一轮重算与入库结果逐字节一致：', ', '.join(ROUND1_SHA256))
+    print('第一轮重算与入库结果逐字节一致：', ', '.join(ROUND1_SHA256), '、trades_oos.csv（去掉手数列）')
     for R in (R1, R2):
         r = R['r']
         print(f'===== {r.name}：样本内 {r.is_start}–{r.is_end}，窗口③ {R["w3"]} 天，冻结参数 '
@@ -83,6 +110,9 @@ def main():
         print('== 原版 ==\n', R['orig'][0][['scope', 'fill', 'ticks'] + cols].round(3).to_string(index=False))
         print('== 修正版 ==\n', R['fix'][0][['version', 'fill'] + cols].round(3).to_string(index=False))
         print('== 样本外 ==\n', R['oos'][0][['fill', 'ticks'] + cols].round(3).to_string(index=False))
+    print('===== round3：滚动检验（保守口径、1 跳、本金 3 倍保证金）=====')
+    m = R3['metrics']
+    print(m[m.fill == 'open'][['variant', 'scope', 'ann_ret', 'mdd', 'sharpe', 'se', 't', 'n', 'win']].round(3).to_string(index=False))
     print(f'report/report.md 已生成，耗时 {time.time() - t0:.1f} 秒')
 
 

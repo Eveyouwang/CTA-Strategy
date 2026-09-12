@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from .analysis import DEMO, ENTRIES, EXITS, FILLS, MAIN_MONTHS, REPORT, W0, WINDOWS, calendar_diff  # noqa: E402
+from .analysis import (CAPITAL, DEMO, ENTRIES, EXITS, FILLS, MAIN_MONTHS, MONEY_STOP, REPORT, SIZE_CAP,  # noqa: E402
+                       VARIANTS, VOL_WIN, W0, WF_TRAIN, WINDOWS, calendar_diff, sharpe_stats)
 from .backtest import FEE, MARGIN  # noqa: E402
 from .data import L_TICK5_BEFORE, pick  # noqa: E402
 
@@ -148,6 +149,70 @@ def figures(R, R1):
               FIG / 'equity_oos.png')
 
 
+def fig_walkforward(R3, path):
+    nav3 = {v: 1 + R3['runs'][v]['open'][0]['ret'].cumsum() for v in VARIANTS}
+    en = {VARIANTS[0]: 'A fixed size', VARIANTS[1]: 'B vol-scaled size', VARIANTS[2]: 'C + money stop'}
+    fig_lines([(f'Walk-forward NAV (next-open fill, 1 tick, capital = {CAPITAL}x margin); '
+                'each year uses only parameters chosen on the 3 preceding years',
+                {en[v]: s for v, s in nav3.items()}, [1])], path, 4)
+
+
+def round3_section(R3):
+    folds, m = R3['folds'], R3['metrics']
+    agg = m[m.fill == 'open'].set_index(['variant', 'scope'])
+    years = sorted(folds.year.unique())
+    rows = []
+    for v in VARIANTS:
+        for scope, label in (('all', f'{years[0]}–{years[-1]} 全部'), ('since2020', '2020 起')):
+            x = agg.loc[(v, scope)]
+            rows.append({'风控': v, '检验年': label, '年化收益': x.ann_ret, '最大回撤': x.mdd, '夏普': x.sharpe,
+                         '夏普标准误': x.se, 't 值': x.t, '交易次数': x.n, '胜率': x.win})
+    t_agg = pd.DataFrame(rows).set_index('风控')
+    fr = []
+    for y in years:
+        f0 = folds[folds.year == y]
+        d = {'训练区间': f0.train.iloc[0]}
+        for v in VARIANTS:
+            x = f0[f0.variant == v].iloc[0]
+            d[f'{v[0]} 参数'] = f'{x.window}/{x.entry:g}/{x.exit:g}'
+            d[f'{v[0]} 收益'] = x.ann_ret
+        fr.append(pd.Series(d, name=y))
+    t_fold = pd.DataFrame(fr).rename_axis('检验年')
+    fmt = {**{f'{v[0]} 收益': pct for v in VARIANTS}, '夏普标准误': num, 't 值': num}
+    a, b, c = (agg.loc[(v, 'all')] for v in VARIANTS)
+    nb = agg.loc[(VARIANTS[1], 'since2020')]
+    zero = [v for v, x in zip(VARIANTS, (a, b, c)) if abs(x.sharpe) < x.se]
+    nwin = folds.groupby('variant')['window'].nunique().max()
+    return f"""
+## 11 滚动检验与风控（第三轮）
+
+前两轮的样本外都只有 1.2 年、7 笔交易，说明不了问题，而 {day(R3['lab'].mkt.dates[-1])} 之前的数据已经全部看过，新规则没有干净的样本外可用。第三轮改用滚动检验：检验年 {years[0]}–{years[-1]}，每个检验年只用它之前 {WF_TRAIN} 个自然年的数据、按与前两轮相同的网格和邻域规则选参数，再只跑这一年。每个检验年对它自己那组参数都是没看过的数据。检验年末强平，跨年不留仓。
+
+信号规则沿用第二轮 v4（冷静期、只在 {'、'.join(MAIN_MONTHS)} 换月、方向性平仓、止损 1.5 × 开仓阈值），在它上面逐档加风控：
+
+- A 固定 1 单位
+- B 按波动定手数：手数 = 训练窗口内 σ 的中位数 / 当前 σ，σ 为在持组过去 {VOL_WIN} 个交易日 S 日变化的标准差（只用当日之前），手数截断到 [{SIZE_CAP[0]:g}, {SIZE_CAP[1]:g}]，开仓时定死
+- C 在 B 上加金额止损：持仓浮亏达到该仓位保证金的 {MONEY_STOP:.0%} 即平
+
+本金口径改为 {CAPITAL} 倍 1 单位保证金（{1 / (CAPITAL * MARGIN):.1f} 倍杠杆）。夏普不随本金变，年化收益与回撤同时除以 {CAPITAL}。下表为保守口径、1 跳成本；2019 整年在三腿交易时段一致之前，所以另列 2020 起的合计。
+
+{table(t_agg, fmt)}
+
+各检验年选出的参数（窗口/开仓/平仓）与当年收益：
+
+{table(t_fold, fmt)}
+
+![滚动检验净值](fig/walkforward.png)
+
+几点：
+
+- 三档风控的夏普{'都' if len(zero) == len(VARIANTS) else ''}在一个标准误之内包含 0（{'、'.join(f'{v[0]} {num(agg.loc[(v, "all")].sharpe)}±{num(agg.loc[(v, "all")].se)}' for v in VARIANTS)}），按第三轮事先写下的判定标准，这套规则在滚动检验下没有可验证的边际。
+- 按波动定手数（B 对 A）同时改善了两头：夏普 {num(a.sharpe)}→{num(b.sharpe)}，最大回撤 {pct(a.mdd)}→{pct(b.mdd)}。把本金放到 {CAPITAL} 倍保证金之后，回撤已经落到 {pct(b.mdd)}，说明前面几轮 90% 的回撤主要来自本金口径（1 倍保证金、{1 / MARGIN:.1f} 倍杠杆），而不是交易本身。
+- 金额止损（C 对 B）两头都变差：夏普 {num(b.sharpe)}→{num(c.sharpe)}，最大回撤 {pct(b.mdd)}→{pct(c.mdd)}，交易次数 {int(b.n)}→{int(c.n)} 笔。它砍掉的是后来会回归的仓位，同时多付了成本，与第 5 节第 1 条、第 6 节冷静期那一步是同一件事的两面。
+- 各检验年选出的窗口在 {nwin} 个取值之间跳（见上表），样本内最优参数本身不稳定。
+"""
+
+
 # ---------- 正文 ----------
 def same_oos(R1, R2):
     """两轮样本外（所有成交口径与滑点档）的交易明细和逐日收益是否完全相同。"""
@@ -200,12 +265,13 @@ def round1_section(R1, R2):
 
 {after}
 
-以下第 2–10 节均为第二轮。
+以下第 2–10 节为第二轮，第 11 节为第三轮。
 """
 
 
-def write(R, R1, meta):
+def write(R, R1, R3, meta):
     figures(R, R1)
+    fig_walkforward(R3, FIG / 'walkforward.png')
     lab, mkt, r = R['lab'], R['lab'].mkt, R['r']
     P, sel, st, lv, df = R['params'], R['sel'], R['stat'], R['live'], R['defects']
     o_tab, fx_tab, g = R['orig'][0], R['fix'][0], R['grid']
@@ -268,7 +334,7 @@ def write(R, R1, meta):
 
     s = [f"""# MTO 价差策略复盘：复现、缺陷与修正
 
-本报告由 `python run_all.py` 生成，文中数字全部由代码从 `data/` 下两个原始文件算出。项目做了两轮：第一轮是原始设计（样本内 {day(R1['r'].is_start)} 起），第二轮是看过第一轮样本外结果之后按要求做的修订（样本内 {day(r.is_start)} 至 {day(r.is_end)}）。两轮的样本外都是 {day(r.oos_start)} 至 {day(last)}。
+本报告由 `python run_all.py` 生成，文中数字全部由代码从 `data/` 下两个原始文件算出。项目做了三轮：第一轮是原始设计（样本内 {day(R1['r'].is_start)} 起，样本外 {day(r.oos_start)} 至 {day(last)}，唯一一次干净的样本外检验）；第二轮是看过第一轮样本外之后按要求做的修订（样本内 {day(r.is_start)} 至 {day(r.is_end)}）；第三轮改用滚动检验，并加了资金与风控，见第 11 节。
 
 """, round1_section(R1, R), f"""
 ## 2 策略概述
@@ -411,14 +477,18 @@ S = 5·L + 5·PP − 30·MA（元/单位）
 
 ## 10 结论与局限
 
-""", conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same_o, one_jump, edge), f"""
+""", conclusions(R, R1, R3, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same_o, one_jump, edge), f"""
 **局限**：
 - 第二轮的三处修改在看过第一轮样本外之后做出，第二轮样本外不是独立检验；独立检验只有第一轮那一次。
 - 第二轮样本内约 {R['is_years']:.1f} 年，冻结参数只有 {int(pc.n)} 笔交易；样本外约 {R['oos_years']:.1f} 年、{int(po.n)} 笔，统计意义有限。
 - 只有日线，信号每天判断一次，盘中触发、分腿成交、冲击成本都没有模拟；滑点按固定跳数假设，没有盘口数据校准。
 - 手续费按名义额万分之一估计，与各期货公司实际费率不同；成本敏感性表给出 0、1、2 跳的结果。
 - 选参只看夏普一个指标，邻域取平均的规则本身也是一种选择；网格以外的参数没有测。
+- 第三轮的滚动检验每个检验年末强平，跨年不留仓；金额止损只测了 {MONEY_STOP:.0%} 一个档位，手数上下限 [{SIZE_CAP[0]:g}, {SIZE_CAP[1]:g}] 也是事先定死的一组值。
+- 手数按连续数值算，实盘 1 单位是 1 手 L + 1 手 PP + 3 手 MA，只能取整数倍，小资金按这个比例下单会有取整误差。
 - 起点依据里，大商所两份通知的官网页面对程序抓取返回脚本页，内容据搜索引擎收录的官网摘要和期货公司全文转载确认；郑商所 2019-12 的通知只找到媒体转载。
+
+{round3_section(R3)}
 
 ## 附：复现
 
@@ -433,7 +503,7 @@ pytest -q                # 数据层与回测引擎测试
     (REPORT / 'report.md').write_text(''.join(s))
 
 
-def conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same, one_jump, edge):
+def conclusions(R, R1, R3, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same, one_jump, edge):
     st, st1 = R['stat'], R1['stat']
     v0_1 = row(R1['orig'][0], scope='full_is', fill='open', ticks=1)
     pc1 = row(R1['cost_is'][0], fill='open', ticks=1)
@@ -462,4 +532,13 @@ def conclusions(R, R1, v0c, fx, names, gi, P, pc, po, pco, q1, d_c, same, one_ju
         + ("z 分数规则两轮的样本内、样本外保守口径夏普都不到 0.5" + ("，样本外保守口径没有正收益" if po.ann_ret <= 0 else '')
            + "，现有证据不支持实盘。" if weak else "第二轮的样本外表现只能作参考，需要用之后的新数据检验。"),
     ]
+    ag = R3['metrics']
+    ag = ag[(ag.fill == 'open') & (ag.scope == 'all')].set_index('variant')
+    best = ag['sharpe'].idxmax()
+    out.append(
+        f"6. 第三轮用滚动检验（{len(R3['folds']['year'].unique())} 个检验年，每年只用之前 {WF_TRAIN} 年选参）重做一遍："
+        + '；'.join(f"{v} 夏普 {num(ag.loc[v, 'sharpe'])}±{num(ag.loc[v, 'se'])}、年化 {pct(ag.loc[v, 'ann_ret'])}、"
+                    f"最大回撤 {pct(ag.loc[v, 'mdd'])}" for v in VARIANTS)
+        + f"。最好的一档是 {best}，夏普仍在一个标准误之内包含 0。按波动定手数能同时改善夏普和回撤，"
+          f"金额止损两头都变差。")
     return '\n'.join(out) + '\n'

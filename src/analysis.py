@@ -22,6 +22,14 @@ from .data import (LEGS, LOTS, ROOT, expiry_calendar, load_market, pick, prev_mo
 REPORT = ROOT / 'report'
 DEMO = dict(month='202409', start='20231101', end='20240430')  # 原版 demo 写死的合约与回测区间
 WINDOWS, ENTRIES, EXITS = (20, 30, 60, 120), (1.5, 2.0, 2.5), (0.0, 0.5, 1.0)
+# 第三轮：滚动检验与风控（设计见 PROGRESS.md「第三轮」，跑之前写定）
+WF_TEST_YEARS = tuple(str(y) for y in range(2019, 2027))
+WF_TRAIN = 3        # 每个检验年用它之前 3 个自然年选参数
+CAPITAL = 3         # 本金 = 3 倍 1 单位保证金（2.8 倍杠杆）
+MONEY_STOP = 0.25   # 单笔浮亏达到该仓位保证金的 25% 即平
+SIZE_CAP = (0.25, 4.0)
+VOL_WIN = 60
+VARIANTS = ('A 固定手数', 'B 波动定手数', 'C 波动定手数+金额止损')
 FILLS = ('close', 'open')
 W0 = 29  # 原版：30 根日线去掉当根
 MAIN_MONTHS = ('01', '05', '09')
@@ -66,9 +74,10 @@ class Lab:
             self._z[w] = zscore(self.mkt.S_close, w)
         return self._z[w]
 
-    def run(self, cal, w, rule, fill, ticks, start, end):
+    def run(self, cal, w, rule, fill, ticks, start, end, size=None, capital=1):
         c = self.cal[cal] if isinstance(cal, str) else cal
-        return backtest(self.mkt, c, self.z(w), rule, fill=fill, ticks=ticks, start=start, end=end)
+        return backtest(self.mkt, c, self.z(w), rule, fill=fill, ticks=ticks, start=start, end=end,
+                        size=size, capital=capital)
 
 
 # ---------- 任务 2 原版 ----------
@@ -161,22 +170,24 @@ def z_coverage(lab, w):
 
 
 # ---------- 任务 4 稳健性（只用样本内）----------
-def rule_of(entry, exit_, stop_mult=1.5):
-    return Rule(entry=entry, exit=exit_, stop_mult=stop_mult, cooldown=True, directional_exit=True)
+def rule_of(entry, exit_, stop_mult=1.5, money_stop=0.0):
+    return Rule(entry=entry, exit=exit_, stop_mult=stop_mult, cooldown=True, directional_exit=True,
+                money_stop=money_stop)
 
 
-def grid(lab):
+def grid(lab, start=None, end=None, size=None, money_stop=0.0, fills=FILLS):
+    start, end = start or lab.r.is_start, end or lab.r.is_end
     rows = []
     for w in WINDOWS:
         for e in ENTRIES:
             for x in EXITS:
-                for fill in FILLS:
-                    d, t = lab.run('roll', w, rule_of(e, x), fill, 1, lab.r.is_start, lab.r.is_end)
+                for fill in fills:
+                    d, t = lab.run('roll', w, rule_of(e, x, money_stop=money_stop), fill, 1, start, end, size=size)
                     rows.append(dict(w=w, entry=e, exit=x, fill=fill, **metrics(d, t)))
     return pd.DataFrame(rows)
 
 
-def select(g, r):
+def select(g, r, sample=None):
     """邻域稳定选参：每格与其在 窗口/开仓/平仓 三个方向上相邻格（含对角，边界处截断）的
     保守口径（次日开盘、1 跳）夏普取平均，选平均最高的格；无交易的格夏普记 0。"""
     s = g[g.fill == 'open'].set_index(['w', 'entry', 'exit'])['sharpe'].sort_index().fillna(0)
@@ -191,7 +202,7 @@ def select(g, r):
                 sharpe=float(a[i, j, k]), neighborhood_sharpe=float(nb[i, j, k]),
                 best_single=dict(window=WINDOWS[bi], entry=ENTRIES[bj], exit=EXITS[bk],
                                  sharpe=float(a[bi, bj, bk]), neighborhood_sharpe=float(nb[bi, bj, bk])),
-                sample=[r.is_start, r.is_end], neighborhood=nb.tolist())
+                sample=sample or [r.is_start, r.is_end], neighborhood=nb.tolist())
 
 
 def yearly(daily, trades):
@@ -261,6 +272,58 @@ def term_structure(lab):
     gap = pd.Series([S.at[d, n] - S.at[d, o] for d, o, n in zip(sw, cal.shift(1).loc[sw], c.loc[sw])], index=sw)
     raw = pick(S, cal).loc[start:end]
     return dict(n=len(gap), gap_mean=gap.mean(), gap_neg=(gap < 0).mean(), raw0=raw.iloc[0], raw1=raw.iloc[-1])
+
+
+def sharpe_stats(ret):
+    """夏普及其近似标准误 sqrt((1 + S²/2) / 年数) 与 t 值：判断夏普是否与 0 分得开。"""
+    s = ret.mean() * DAYS / (ret.std() * np.sqrt(DAYS))
+    se = np.sqrt((1 + s ** 2 / 2) / (len(ret) / DAYS))
+    return dict(sharpe=s, se=se, t=s / se, years=len(ret) / DAYS)
+
+
+def spread_vol(lab):
+    """在持组过去 VOL_WIN 个交易日 S 日变化的标准差，只用当日之前的数据。"""
+    S, cal = lab.mkt.S_close, lab.cal['roll']
+    prev = cal.shift(1)
+    return (pick(S, prev) - pick(S.shift(1), prev)).rolling(VOL_WIN).std().shift(1)
+
+
+def walk_forward(lab, variant, vol=None):
+    """滚动检验：每个检验年用它之前 WF_TRAIN 个自然年、按与前两轮相同的网格与邻域规则选参，再只跑这一年。
+    A 固定 1 单位；B 手数 = 训练窗口 σ 中位数 / 当前 σ（截断 SIZE_CAP），开仓定死；C 在 B 上加金额止损。"""
+    vol = spread_vol(lab) if vol is None else vol
+    last = lab.mkt.dates[-1]
+    folds, runs = [], {f: {'daily': [], 'trades': []} for f in FILLS}
+    for y in WF_TEST_YEARS:
+        tr0, tr1, te0 = f'{int(y) - WF_TRAIN}0101', f'{int(y) - 1}1231', f'{y}0101'
+        if te0 > last:
+            break
+        te1 = min(f'{y}1231', last)
+        ms = MONEY_STOP if variant.startswith('C') else 0.0
+        size = None if variant.startswith('A') else (vol.loc[tr0:tr1].median() / vol).clip(*SIZE_CAP)
+        p = select(grid(lab, tr0, tr1, size=size, money_stop=ms, fills=('open',)), lab.r, sample=[tr0, tr1])
+        rule = rule_of(p['entry'], p['exit'], money_stop=ms)
+        for f in FILLS:
+            d, t = lab.run('roll', p['window'], rule, f, 1, te0, te1, size=size, capital=CAPITAL)
+            runs[f]['daily'].append(d.assign(variant=variant, year=y))
+            runs[f]['trades'].append(t.assign(variant=variant, year=y))
+        d, t = runs['open']['daily'][-1], runs['open']['trades'][-1]
+        folds.append(dict(variant=variant, year=y, train=f'{tr0[:4]}-{tr1[:4]}', window=p['window'],
+                          entry=p['entry'], exit=p['exit'], qty_med=t.qty.median() if len(t) else np.nan,
+                          **metrics(d, t)))
+    out = {f: (pd.concat(v['daily']), pd.concat(v['trades'], ignore_index=True)) for f, v in runs.items()}
+    return pd.DataFrame(folds), out
+
+
+def wf_summary(folds, runs, since=None):
+    """把各检验年的逐日收益接成一条曲线算合计指标；since 给定时只取该年及以后的检验年。"""
+    out = {}
+    for f, (d, t) in runs.items():
+        dd = d if since is None else d[d.year >= since]
+        tt = t if since is None else t[t.year >= since]
+        st = sharpe_stats(dd['ret'])
+        out[f] = {**metrics(dd, tt), 'se': st['se'], 't': st['t'], 'years': st['years']}
+    return out
 
 
 def calendar_diff(R1, R2):

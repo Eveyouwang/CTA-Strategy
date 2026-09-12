@@ -95,3 +95,29 @@ def test_real_run_accounting_and_no_delivery_month(real, fill):
     held = daily[daily.pos != 0]
     assert (held.index.str[:6] != held.month).all()
     assert (held.index < held.month.map(prev_month_start)).all()
+
+
+def test_size_scales_pnl_and_cost():
+    """手数：盈亏与成本按手数等比例变化，信号日、成交日、方向都不变。"""
+    mkt, cal, z = toy(Z_PATH)
+    kw = dict(fill='close', ticks=1, start=mkt.dates[1], end=mkt.dates[-1])
+    d1, t1 = backtest(mkt, cal, z, Rule(), **kw)
+    d2, t2 = backtest(mkt, cal, z, Rule(), size=pd.Series(2.0, index=mkt.dates), **kw)
+    assert list(t1.open_signal) == list(t2.open_signal) and list(t1.close_signal) == list(t2.close_signal)
+    assert (t2.qty == 2).all() and (t1.qty == 1).all()
+    assert np.allclose(t2.pnl, 2 * t1.pnl) and np.allclose(t2.cost, 2 * t1.cost)
+    assert np.allclose(d2.pnl, 2 * d1.pnl) and np.allclose(d2.cost, 2 * d1.cost)
+
+
+def test_money_stop_cuts_the_losing_trade():
+    """金额止损：取一笔中途浮亏、最后止盈的交易，把阈值设在它浮亏的一半，它必须在止盈前被平掉。
+    z 止损与金额止损同一天触发时按 z 止损记（引擎里 z 的判断在前）。"""
+    mkt, cal, z = toy(Z_PATH)
+    kw = dict(fill='close', ticks=0, start=mkt.dates[1], end=mkt.dates[-1])
+    _, t0 = backtest(mkt, cal, z, Rule(), **kw)
+    ref = t0[(t0.reason == 'take_profit') & (t0.mae < 0)].iloc[0]
+    lvl = abs(ref.mae) / ref.margin / 2
+    _, t1 = backtest(mkt, cal, z, Rule(money_stop=lvl), **kw)
+    hit = t1[t1.open_signal == ref.open_signal].iloc[0]
+    assert hit.reason == 'money_stop' and hit.close_signal < ref.close_signal
+    assert ref.mae <= hit.pnl < 0  # 提前离场：亏损不超过原来的浮亏最低点

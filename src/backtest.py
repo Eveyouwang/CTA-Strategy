@@ -24,6 +24,7 @@ class Rule:
     stop_mult: float = 1.5          # 止损阈值 = entry × 1.5（原版 STD_THRESHOLD * 1.5 = 3）
     cooldown: bool = False          # 修正①：止损后 |z| 回到 entry 以内才可再开
     directional_exit: bool = False  # 修正④：空头 z<exit、多头 z>-exit 即平；原版为 |z|<exit
+    money_stop: float = 0.0         # 第三轮风控：持仓浮亏达到该仓位保证金的这个比例即平，0 为不启用
 
 
 def decide(pos, z, rule, cool):
@@ -50,8 +51,10 @@ def unit_cost(mkt, px, ticks):
     return sum(LOTS[l] * mkt.unit[l] * (px[l] * FEE + ticks * mkt.tick[l]) for l in LEGS)
 
 
-def backtest(mkt, cal, z, rule, fill='close', ticks=1, start=None, end=None):
-    """cal：每日在持交割月；z：交易日 × 交割月 的 z 面板。返回 (逐日表, 交易表)。"""
+def backtest(mkt, cal, z, rule, fill='close', ticks=1, start=None, end=None, size=None, capital=1):
+    """cal：每日在持交割月；z：交易日 × 交割月 的 z 面板。
+    size：每日手数（按交易日索引的 Series），开仓当天取值并在持仓期间不变，None 为固定 1 单位；
+    capital：本金相当于几倍 1 单位保证金（只影响收益率口径，不影响信号与成交）。返回 (逐日表, 交易表)。"""
     dates = mkt.dates
     i0 = int(np.searchsorted(dates, start))
     i1 = int(np.searchsorted(dates, end, side='right')) - 1
@@ -63,10 +66,12 @@ def backtest(mkt, cal, z, rule, fill='close', ticks=1, start=None, end=None):
     Cc = unit_cost(mkt, mkt.close, ticks).to_numpy()
     Co = unit_cost(mkt, mkt.open, ticks).to_numpy()
     N = mkt.notional.to_numpy()
-    base = MARGIN * pick(mkt.notional, cal.reindex(dates)).shift(1).to_numpy()
+    base = capital * MARGIN * pick(mkt.notional, cal.reindex(dates)).shift(1).to_numpy()
+    qty = np.ones(len(dates)) if size is None else size.reindex(dates).to_numpy()
+    assert np.isfinite(qty[i0:i1 + 1]).all(), '评估期内每天都要有手数'
     exp_i = {m: int(np.searchsorted(dates, mkt.expiry[m])) for m in set(mon[i0 - 1:i1 + 1])}
 
-    pos, held, cool, pending, cur = 0, None, False, None, None
+    pos, held, cool, pending, cur, q = 0, None, False, None, None, 0.0
     rows, trades = [], []
 
     def mark(x):  # 逐段盯市，记入当前交易；mae 为持仓期间累计毛盈亏的最低点
@@ -75,28 +80,29 @@ def backtest(mkt, cal, z, rule, fill='close', ticks=1, start=None, end=None):
         return x
 
     def execute(i, when, new, month, sig, reason):
-        nonlocal pos, held, cur
+        nonlocal pos, held, cur, q
         if new == pos and month == held:
             return 0.0
         C, S = (Cc, Sc) if when == 'close' else (Co, So)
-        out = C[i, col[held]] if pos else 0.0
-        if new:
-            out += C[i, col[month]]
-        if pos and new == pos:  # 换月：同方向移仓，交易记录延续
+        if pos and new == pos:  # 换月：同方向移仓，手数不变，交易记录延续
+            out = (C[i, col[held]] + C[i, col[month]]) * q
             cur['rolls'] += 1
             cur['cost'] += out
         else:
+            out = C[i, col[held]] * q if pos else 0.0
             if pos:
                 cur.update(close_signal=dates[sig], close_exec=dates[i], reason=reason,
                            z_close=Z[sig, col[mon[sig]]], S_exit=S[i, col[held]],
-                           hold_days=i - cur.pop('_i'), cost=cur['cost'] + C[i, col[held]])
+                           hold_days=i - cur.pop('_i'), cost=cur['cost'] + C[i, col[held]] * q)
                 trades.append(cur)
-                cur = None
+                cur, q = None, 0.0
             if new:
+                q = qty[sig]
+                out += C[i, col[month]] * q
                 cur = dict(open_signal=dates[sig], open_exec=dates[i], side=new, month=month,
-                           z_open=Z[sig, col[month]], S_entry=S[i, col[month]], _i=i,
-                           margin=MARGIN * N[sig, col[month]], rolls=0, pnl=0.0, mae=0.0,
-                           cost=C[i, col[month]])
+                           z_open=Z[sig, col[month]], S_entry=S[i, col[month]], _i=i, qty=q,
+                           margin=MARGIN * N[sig, col[month]] * q, rolls=0, pnl=0.0, mae=0.0,
+                           cost=C[i, col[month]] * q)
         pos, held = new, month
         return out
 
@@ -105,16 +111,18 @@ def backtest(mkt, cal, z, rule, fill='close', ticks=1, start=None, end=None):
         pnl = cost = 0.0
         if fill == 'close':
             if pos:
-                pnl = mark(pos * (Sc[i, col[held]] - Sc[i - 1, col[held]]))
+                pnl = mark(q * pos * (Sc[i, col[held]] - Sc[i - 1, col[held]]))
         else:
             if pos:  # 隔夜：前一日收盘到今日开盘，仍是旧仓位
-                pnl = mark(pos * (So[i, col[held]] - Sc[i - 1, col[held]]))
+                pnl = mark(q * pos * (So[i, col[held]] - Sc[i - 1, col[held]]))
             if pending:
                 cost += execute(i, 'open', *pending)
                 pending = None
             if pos:  # 日内：今日开盘到收盘，成交后的仓位
-                pnl += mark(pos * (Sc[i, col[held]] - So[i, col[held]]))
+                pnl += mark(q * pos * (Sc[i, col[held]] - So[i, col[held]]))
         new, reason, cool = decide(pos, Z[i, col[m]], rule, cool)
+        if pos and new == pos and rule.money_stop and cur['pnl'] < -rule.money_stop * cur['margin']:
+            new, reason = 0, 'money_stop'  # 金额止损：浮亏超过该仓位保证金的给定比例
         if pos and (i == i1 or i == exp_i[held]):
             new, reason = 0, ('end' if i == i1 else 'expiry')
         elif not pos and (i == i1 or i == exp_i[m]):  # 最后一天、到期日不开新仓
@@ -129,7 +137,7 @@ def backtest(mkt, cal, z, rule, fill='close', ticks=1, start=None, end=None):
     daily = pd.DataFrame(rows, columns=['date', 'pnl', 'cost', 'pos', 'month', 'base']).set_index('date')
     assert daily[['pnl', 'cost', 'base']].notna().all().all(), '在持合约有缺价，盈亏算不出'
     daily['ret'] = (daily['pnl'] - daily['cost']) / daily['base']
-    cols = ['open_signal', 'open_exec', 'close_signal', 'close_exec', 'side', 'month', 'reason',
+    cols = ['open_signal', 'open_exec', 'close_signal', 'close_exec', 'side', 'month', 'reason', 'qty',
             'z_open', 'z_close', 'S_entry', 'S_exit', 'hold_days', 'rolls', 'pnl', 'mae', 'cost', 'margin']
     t = pd.DataFrame(trades, columns=cols)
     t['net'] = t['pnl'] - t['cost']
