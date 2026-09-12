@@ -183,6 +183,11 @@ def round3_section(R3):
     nb = agg.loc[(VARIANTS[1], 'since2020')]
     zero = [v for v, x in zip(VARIANTS, (a, b, c)) if abs(x.sharpe) < x.se]
     nwin = folds.groupby('variant')['window'].nunique().max()
+    cw = R3['cost'].pivot(index='ticks', columns='variant', values='sharpe')
+    t_cost = cw.rename_axis('滑点跳数').rename(columns={v: v.split(' ')[1] for v in VARIANTS})
+    lo, hi = R3['cost'].sharpe.min(), R3['cost'].sharpe.max()
+    se_max = R3['cost'].se.max()
+    cost_fmt = {c: num for c in t_cost.columns}
     return f"""
 ## 11 滚动检验与风控（第三轮）
 
@@ -210,6 +215,12 @@ def round3_section(R3):
 - 按波动定手数（B 对 A）同时改善了两头：夏普 {num(a.sharpe)}→{num(b.sharpe)}，最大回撤 {pct(a.mdd)}→{pct(b.mdd)}。把本金放到 {CAPITAL} 倍保证金之后，回撤已经落到 {pct(b.mdd)}，说明前面几轮 90% 的回撤主要来自本金口径（1 倍保证金、{1 / MARGIN:.1f} 倍杠杆），而不是交易本身。
 - 金额止损（C 对 B）两头都变差：夏普 {num(b.sharpe)}→{num(c.sharpe)}，最大回撤 {pct(b.mdd)}→{pct(c.mdd)}，交易次数 {int(b.n)}→{int(c.n)} 笔。它砍掉的是后来会回归的仓位，同时多付了成本，与第 5 节第 1 条、第 6 节冷静期那一步是同一件事的两面。
 - 各检验年选出的窗口在 {nwin} 个取值之间跳（见上表），样本内最优参数本身不稳定。
+
+**成本敏感性**：每个滑点档都按该档的成本假设重新选参数，合计夏普（保守口径）：
+
+{table(t_cost, cost_fmt)}
+
+零成本下三档都是负的；滑点提高反而有的变好，因为成本假设一变，每年选出的参数就跟着变。三个档位之间的差别（{num(lo)} 到 {num(hi)}）小于夏普的标准误（约 {num(se_max)}），属于噪声。结论不是被成本压掉的。
 """
 
 

@@ -68,19 +68,25 @@ def run_wf(mkt):
     """第三轮：滚动检验（每个检验年只用它之前 3 年选参）× 三档风控。"""
     lab = A.Lab(A.ROUND2, mkt)
     vol = A.spread_vol(lab)
-    folds, runs, rows = [], {}, []
+    folds, runs, rows, cost = [], {}, [], []
     for v in A.VARIANTS:
-        f, r = A.walk_forward(lab, v, vol)
-        folds.append(f)
-        runs[v] = r
-        for scope, since in (('all', None), ('since2020', '2020')):
-            for fill, m in A.wf_summary(f, r, since=since).items():
-                rows.append(dict(variant=v, scope=scope, fill=fill, **m))
-    R = dict(lab=lab, folds=pd.concat(folds, ignore_index=True), runs=runs, metrics=pd.DataFrame(rows))
+        for tk in (0, 1, 2):  # 成本敏感性：每个滑点档都按该假设重新选参
+            f, r = A.walk_forward(lab, v, vol, ticks=tk)
+            cost.append(dict(variant=v, ticks=tk, **A.wf_summary(f, r)['open']))
+            if tk != 1:
+                continue
+            folds.append(f)
+            runs[v] = r
+            for scope, since in (('all', None), ('since2020', '2020')):
+                for fill, m in A.wf_summary(f, r, since=since).items():
+                    rows.append(dict(variant=v, scope=scope, fill=fill, **m))
+    R = dict(lab=lab, folds=pd.concat(folds, ignore_index=True), runs=runs, metrics=pd.DataFrame(rows),
+             cost=pd.DataFrame(cost))
     out = A.REPORT / 'round3'
     out.mkdir(parents=True, exist_ok=True)
     R['folds'].to_csv(out / 'folds.csv', index=False)
     R['metrics'].to_csv(out / 'metrics_wf.csv', index=False)
+    R['cost'].to_csv(out / 'cost_wf.csv', index=False)
     pd.concat([runs[v]['open'][1] for v in A.VARIANTS]).to_csv(out / 'trades_wf.csv', index=False)
     pd.DataFrame({v: 1 + runs[v]['open'][0]['ret'].cumsum() for v in A.VARIANTS}).to_csv(out / 'nav_wf.csv')
     return R

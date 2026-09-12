@@ -175,14 +175,14 @@ def rule_of(entry, exit_, stop_mult=1.5, money_stop=0.0):
                 money_stop=money_stop)
 
 
-def grid(lab, start=None, end=None, size=None, money_stop=0.0, fills=FILLS):
+def grid(lab, start=None, end=None, size=None, money_stop=0.0, fills=FILLS, ticks=1):
     start, end = start or lab.r.is_start, end or lab.r.is_end
     rows = []
     for w in WINDOWS:
         for e in ENTRIES:
             for x in EXITS:
                 for fill in fills:
-                    d, t = lab.run('roll', w, rule_of(e, x, money_stop=money_stop), fill, 1, start, end, size=size)
+                    d, t = lab.run('roll', w, rule_of(e, x, money_stop=money_stop), fill, ticks, start, end, size=size)
                     rows.append(dict(w=w, entry=e, exit=x, fill=fill, **metrics(d, t)))
     return pd.DataFrame(rows)
 
@@ -288,7 +288,7 @@ def spread_vol(lab):
     return (pick(S, prev) - pick(S.shift(1), prev)).rolling(VOL_WIN).std().shift(1)
 
 
-def walk_forward(lab, variant, vol=None):
+def walk_forward(lab, variant, vol=None, ticks=1):
     """滚动检验：每个检验年用它之前 WF_TRAIN 个自然年、按与前两轮相同的网格与邻域规则选参，再只跑这一年。
     A 固定 1 单位；B 手数 = 训练窗口 σ 中位数 / 当前 σ（截断 SIZE_CAP），开仓定死；C 在 B 上加金额止损。"""
     vol = spread_vol(lab) if vol is None else vol
@@ -301,10 +301,10 @@ def walk_forward(lab, variant, vol=None):
         te1 = min(f'{y}1231', last)
         ms = MONEY_STOP if variant.startswith('C') else 0.0
         size = None if variant.startswith('A') else (vol.loc[tr0:tr1].median() / vol).clip(*SIZE_CAP)
-        p = select(grid(lab, tr0, tr1, size=size, money_stop=ms, fills=('open',)), lab.r, sample=[tr0, tr1])
+        p = select(grid(lab, tr0, tr1, size=size, money_stop=ms, fills=('open',), ticks=ticks), lab.r, sample=[tr0, tr1])
         rule = rule_of(p['entry'], p['exit'], money_stop=ms)
         for f in FILLS:
-            d, t = lab.run('roll', p['window'], rule, f, 1, te0, te1, size=size, capital=CAPITAL)
+            d, t = lab.run('roll', p['window'], rule, f, ticks, te0, te1, size=size, capital=CAPITAL)
             runs[f]['daily'].append(d.assign(variant=variant, year=y))
             runs[f]['trades'].append(t.assign(variant=variant, year=y))
         d, t = runs['open']['daily'][-1], runs['open']['trades'][-1]
